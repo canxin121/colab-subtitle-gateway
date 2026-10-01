@@ -54,11 +54,13 @@ start_gateway() {
   : > "$GW_LOG"
   # 必须 cd 进 repo 再 -m gateway: python -m 靠 sys.path[0]=cwd 找包, 而 kernel 的
   # cwd 是 /content, 直接跑会 "No module named gateway" (日志里看着像秒退)。
-  setsid nohup bash -c "cd '$REPO' && exec '$PY' -m gateway --device cuda --port '$PORT' \
+  # 先写 pid 文件再进后台: bash -c 会把 $$ 换成那个子 shell 自己的 pid, 正是我们
+  # 需要用来 kill 的进程。
+  setsid nohup bash -c "echo \$\$ > '$GW_PID'; exec '$PY' -m gateway --device cuda --port '$PORT' \
     --cache-dir '$REPO/models_cache' --translate-free google,edge" \
     >> "$GW_LOG" 2>&1 < /dev/null &
-  echo $! > "$GW_PID"
-  log "gateway started pid=$(cat "$GW_PID")"
+  sleep 1
+  log "gateway started pid=$(cat "$GW_PID" 2>/dev/null || echo '?')"
 }
 
 stop_gateway() {
@@ -86,7 +88,11 @@ start_tunnel() {
   [ -x "$CFG" ] || { log "cloudflared missing"; return 1; }
   [ "$TUNNEL_MODE" = "off" ] && { log "tunnel disabled"; return 0; }
   if tun_alive; then log "tunnel already up: $(cat "$URL_FILE")"; return 0; fi
-  : > "$TU_LOG"; rm -f "$URL_FILE"
+  : > "$TU_LOG"
+  # quick tunnel 每次重建都是一个新域名。旧地址不清掉的话, tun_alive 会拿它去探活,
+  # 碰巧对方还在线就误判成"隧道还活着"; 而且 start_tunnel 走到这里本来就意味着旧隧道
+  # 已经不通了, 留着一个死地址只会让 status / wait_url 读到过期信息。
+  [ "$TUNNEL_MODE" = "quick" ] && rm -f "$URL_FILE"
 
   if [ -n "$TUNNEL_NAME" ]; then                 # 命名隧道: 域名固定, 每次重建会话也不变
     setsid nohup "$CFG" tunnel --no-autoupdate run --url "http://127.0.0.1:$PORT" "$TUNNEL_NAME" \

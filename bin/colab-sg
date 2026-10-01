@@ -494,8 +494,16 @@ cmd_status() {
   fi
   colab_to 90 status -s "$SESSION" 2>/dev/null | sed 's/^/  /'
   dim "  ── 服务 ──"
-  remote_supervisor status 2>/dev/null | sed 's/^/  /'
-  [ -s "$URL_FILE" ] && ok "  公网地址: $(cat "$URL_FILE")"
+  local svc; svc="$(remote_supervisor status 2>/dev/null)"
+  printf '%s\n' "$svc" | sed 's/^/  /'
+  if [ -s "$URL_FILE" ]; then
+    # 隧道没起来时 url 文件里是上一次的地址, 别当下线中的服务显示
+    if printf '%s\n' "$svc" | grep -q 'tunnel:   UP'; then
+      ok "  公网地址: $(cat "$URL_FILE")"
+    else
+      dim "  上次地址(当前未上线): $(cat "$URL_FILE")"
+    fi
+  fi
 }
 
 cmd_url() {
