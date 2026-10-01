@@ -173,12 +173,15 @@ templates/              launchd plist 与 systemd unit 模板
 `bin/colab-sg` 会把 `remote/*` 按需 base64 注入 VM，因此本地改完脚本，下一次
 `up`/`setup` 就生效，不需要在 VM 上手动同步。
 
-## 两个已知坑（已在脚本里处理）
+## 三个已知坑（已在脚本里处理）
 
-1. **funasr 的依赖解析**：`funasr 1.4.16` 对 `transformers` 没有版本下限，在新 Python 上会解到
+1. **`colab exec` 只吃 Python**：`colab exec` 把内容当 notebook cell 执行，第一行是 shell 就
+   `SyntaxError`；它也不吃位置参数（只能 `-f` 或 stdin）。仓库里所有远端调用都统一走
+   「临时文件 + `-f` + `%%bash` 头」，所以 `colab-sg exec 'ls /content'` 能用。
+2. **funasr 的依赖解析**：`funasr 1.4.16` 对 `transformers` 没有版本下限，在新 Python 上会解到
    `transformers 4.12.2 → tokenizers 0.10.3`，后者需要 Rust 编译，装不上且**回滚整个事务**
    （连 torch 一起丢）。所以 setup 里显式钉了 `transformers>=4.49,<5`、`tokenizers>=0.21`。
-2. **CUDA wheel 不要走 `cu128` index**：Colab 驱动的 580 分支下，`torch==2.13.0` 从 PyPI
+3. **CUDA wheel 不要走 `cu128` index**：Colab 驱动的 580 分支下，`torch==2.13.0` 从 PyPI
    默认就装成 `+cu130`（拉 `nvidia-*-cu13`），`torch.cuda.is_available()` 为 True；而
    `download.pytorch.org/whl/cu128` 最高只到 torch 2.9.1。直接用 PyPI 默认即可。
 
@@ -193,6 +196,7 @@ templates/              launchd plist 与 systemd unit 模板
 | `CSG_TUNNEL_MODE` | `quick` | `quick` / `off`（`off` = 不开隧道） |
 | `CSG_TUNNEL_NAME` | 空 | 命名隧道名，给了就用固定域名 |
 | `CSG_UV_INDEX` | 空 | uv 的 index（国内网络可设阿里云镜像） |
+| `CSG_PROXY` | 空 | 访问 Google 用的代理（如 `http://127.0.0.1:7890`）；不设时会自动读环境里的 `HTTPS_PROXY` |
 | `CSG_SEED_CACHE` | 空 | 已存在的模型缓存目录，首次部署时硬链接复用，省一次下载 |
 | `CSG_ON_URL_CHANGE` | 空 | 地址变化时的钩子，可用 `$CSG_URL` / `$CSG_OLD_URL` |
 | `CSG_EXEC_TIMEOUT` | `180` | 单次 `colab exec` 墙钟上限 |

@@ -31,6 +31,8 @@ ON_URL_CHANGE="${CSG_ON_URL_CHANGE:-}"
 CF_TOKEN_FILE="${CSG_CF_TOKEN_FILE:-$CONFIG_DIR/cloudflare.token}"
 VM_DRIVER="$STATE_DIR/driver.sh"
 UPSTREAM_REPO="${CSG_UPSTREAM:-https://github.com/canxin121/subtitle-gateway.git}"
+# 访问 Google 需要代理的网络里, 给 colab CLI 指一个代理 (例如 http://127.0.0.1:7890)
+PROXY="${CSG_PROXY:-}"
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SRC_REMOTE="$SELF_DIR/../remote"
@@ -94,6 +96,8 @@ colab-sg $CSG_VERSION — Colab GPU 上的 subtitle-gateway 服务端 + 公网�
   -n, --tunnel-name N   命名隧道名, 域名固定 (需 Cloudflare API Token)
       --cf-token-file F Cloudflare API Token 文件 (默认 \$CONFIG_DIR/cloudflare.token)
       --timeout N       单次 colab exec 超时秒数 (默认 180)
+      --proxy URL       访问 Google 走的代理 (如 http://127.0.0.1:7890); 也可用 \$CSG_PROXY
+                        (没有时自动读环境里的 HTTPS_PROXY)
       --interval N      watch: 保活间隔秒数 (默认 120)
       --on-url-change C watch: 地址变化时执行 C (新地址在 \$CSG_URL)
   -f, --force           setup: 强制重装依赖; up: 强制重建会话
@@ -118,6 +122,7 @@ while [ $# -gt 0 ]; do
     -n|--tunnel-name)  TUNNEL_NAME="$2"; shift 2 ;;
     --cf-token-file)   CF_TOKEN_FILE="$2"; shift 2 ;;
     --timeout)         EXEC_TIMEOUT="$2"; shift 2 ;;
+    --proxy)           PROXY="$2"; shift 2 ;;
     --interval)        WATCH_INTERVAL="$2"; shift 2 ;;
     --on-url-change)   ON_URL_CHANGE="$2"; shift 2 ;;
     -f|--force)        FORCE=1; shift ;;
@@ -138,9 +143,47 @@ esac
 # --------------------------------------------------------------------------
 need_colab() { command -v colab >/dev/null 2>&1 || die "找不到 colab CLI。装: uv tool install google-colab-cli"; }
 
-# 一段 bash 从 stdin 送进 VM 跑
-vm_run() { RUN_TO "$EXEC_TIMEOUT" colab exec -s "$SESSION" "$@" 2>&1; }
-vm_cmd() { printf '%s\n' "$*" | vm_run /dev/stdin; }
+# 只在真正需要访问 Google 的调用上套代理: 本机对 google 域名的解析可能被劫持/污染,
+# 直连会挂在超时上 (colab sessions 无输出地卡 2 分钟), 走代理立刻返回。
+# 注意 Cloudflare 隧道与本地 curl 不走这里, 避免把本来直连就通的流量绕出去。
+# 必须经 `env` 而不是直接前缀变量: RUN_TO 是 timeout(外部命令), 它没法执行 shell 函数。
+colab_to() {  # $1 = 超时秒数, 其余是 colab 的子命令
+  local t="$1"; shift
+  if [ -n "$PROXY" ]; then
+    RUN_TO "$t" env \
+      HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" ALL_PROXY="$PROXY" \
+      NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
+      colab "$@"
+  else
+    RUN_TO "$t" colab "$@"
+  fi
+}
+
+# 一段 shell 从 stdin 送进 VM 跑。
+# colab exec 送过去的是 notebook cell, 默认按 Python 解析 —— 所以必须带 %%bash
+# 魔法, 否则第一行就被当成语法错误。另外 colab exec 不吃位置参数, 也不接受
+# /dev/stdin 之类的路径参数: 代码只能走 stdin 或 -f <file>。stdin 会和
+# vm_put / vm_launch 里 "先读本地文件再拼脚本" 的 heredoc 抢管道, 所以统一落成
+# 临时文件用 -f 送 (%%bash 头部在这里加)。
+vm_run() {  # stdin = 要在 VM 上执行的 shell
+  local f; f="$(mktemp "${TMPDIR:-/tmp}/csg-exec.XXXXXX")" || die "mktemp 失败"
+  { printf '%%%%bash\n'; cat; } > "$f"
+  local rc=0
+  colab_to "$EXEC_TIMEOUT" exec -s "$SESSION" --timeout "$EXEC_TIMEOUT" -f "$f" 2>&1 || rc=$?
+  rm -f "$f"
+  return $rc
+}
+vm_cmd() { printf '%s\n' "$*" | vm_run; }
+
+# 本地文件原样送进 VM 跑 (自动补 %%bash 头)
+vm_run_file() {
+  local f; f="$(mktemp "${TMPDIR:-/tmp}/csg-exec.XXXXXX")" || die "mktemp 失败"
+  { printf '%%%%bash\n'; cat "$1"; } > "$f"
+  local rc=0
+  colab_to "$EXEC_TIMEOUT" exec -s "$SESSION" --timeout "$EXEC_TIMEOUT" -f "$f" 2>&1 || rc=$?
+  rm -f "$f"
+  return $rc
+}
 
 # 把本地文件 base64 注入 VM (路径可含空格/引号, 内容二进制安全)
 vm_put() {  # $1 本地文件  $2 远端路径
@@ -150,12 +193,18 @@ vm_put() {  # $1 本地文件  $2 远端路径
     base64 < "$1" | tr -d '\n'; echo
     echo '__CSG_B64__'
     echo "chmod 600 '$2'"
-  } | vm_run /dev/stdin
+  } | vm_run
 }
 
 # 长任务: 送脚本进 VM → 脱离 kernel 后台跑 → 返回 (不等它结束)
 vm_launch() {  # $1 本地脚本  $2 任务名
-  local name="$2" rscript="$SRC_DIR/$name.sh" rlog="$RUN_DIR/$name.log" rdone="$RUN_DIR/$name.done"
+  # 一次 local 里不能自引用 ($name 在整条语句展开完之前还是空的, set -u 下直接报 unbound)
+  local name="$2"
+  local rscript="$SRC_DIR/$name.sh" rlog="$RUN_DIR/$name.log" rdone="$RUN_DIR/$name.done"
+  # 注意: 这段脚本靠 "最后一条命令的退出码" 汇报成功与否, 所以不能用
+  # `pgrep ... && echo || echo` —— 那样最后一条是 echo, 永远返回 0。
+  # 后台任务的启动必须放进一个独立的后台 shell, 否则它会被 %%bash 的
+  # cell 生命周期绑住 (IPython 会等它, 之后还可能把它带走)。
   {
     echo "mkdir -p '$RUN_DIR' '$SRC_DIR'"
     echo "base64 -d > '$rscript' <<'__CSG_B64__'"
@@ -163,8 +212,10 @@ vm_launch() {  # $1 本地脚本  $2 任务名
     echo '__CSG_B64__'
     echo "chmod +x '$rscript'; rm -f '$rdone'"
     echo "setsid nohup bash -c 'bash \"$rscript\"; echo \$? > \"$rdone\"' > '$rlog' 2>&1 < /dev/null &"
-    echo "sleep 2; pgrep -f '$name.sh' >/dev/null && echo LAUNCHED || echo 'LAUNCH_FAILED (看 $rlog)'"
-  } | vm_run /dev/stdin
+    echo "sleep 2"
+    echo "pgrep -f '$name.sh' >/dev/null || { echo 'LAUNCH_FAILED (看 $rlog)'; exit 1; }"
+    echo "echo LAUNCHED"
+  } | vm_run
 }
 
 # 轮询长任务: 心跳日志打屏; 结束返回任务退出码
@@ -189,18 +240,42 @@ vm_wait() {  # $1 任务名  $2 超时秒  $3 进度匹配(可选)
 # --------------------------------------------------------------------------
 # 会话
 # --------------------------------------------------------------------------
-sessions_raw() { RUN_TO 90 colab sessions 2>/dev/null; }
-session_exists() { sessions_raw | grep -qE "^\[$SESSION\]"; }
-session_accel() { sessions_raw | grep -E "^\[$SESSION\]" | sed -n 's/.*Hardware: \([^ ]*\).*/\1/p'; }
+sessions_capture() {   # 设置全局 SESSIONS_OUT / SESSIONS_RC (不能用 $(...) 包, 否则退出码丢在子 shell 里)
+  SESSIONS_OUT="$(colab_to 120 sessions 2>/dev/null)"; SESSIONS_RC=$?
+  # 直连失败时, 若环境里本来就有代理, 再走一次代理 (DNS 被污染时直连会白等 2 分钟)
+  if [ -z "$SESSIONS_OUT" ] && [ "$SESSIONS_RC" -ne 0 ] && [ -z "$PROXY" ]; then
+    local p="${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}"
+    if [ -n "$p" ]; then
+      warn "直连 colab 失败, 改用环境代理 $p"
+      PROXY="$p"
+      SESSIONS_OUT="$(colab_to 120 sessions 2>/dev/null)"; SESSIONS_RC=$?
+    fi
+  fi
+}
+session_exists() { sessions_capture; printf '%s\n' "$SESSIONS_OUT" | grep -qE "^\[$SESSION\]"; }
+session_accel()  { sessions_capture; printf '%s\n' "$SESSIONS_OUT" | grep -E "^\[$SESSION\]" | sed -n 's/.*Hardware: \([^ ]*\).*/\1/p'; }
+
+# "查不到" 和 "不存在" 是两回事: 网络不通时 colab sessions 会超时返回空,
+# 若当成"会话不存在"就会去建会话, 白白撞上 TooManyAssignments。
+sessions_or_die() {
+  sessions_capture
+  if [ -z "$SESSIONS_OUT" ] && [ "$SESSIONS_RC" -ne 0 ]; then
+    die "查询 Colab 会话失败 (colab sessions 退出码 $SESSIONS_RC)。
+   若本机需要代理才能访问 Google, 明确指定一个再重试:
+     CSG_PROXY=http://127.0.0.1:7890 colab-sg ${CMD:-up}"
+  fi
+  printf '%s\n' "$SESSIONS_OUT"
+}
 
 # 会话在, 但 kernel 可能正忙着别的 (colab exec 会排队)。忙就等一会儿再动手。
 session_ensure() {
-  if session_exists; then
-    local accel; accel="$(session_accel)"
+  local raw; raw="$(sessions_or_die)"
+  if printf '%s\n' "$raw" | grep -qE "^\[$SESSION\]"; then
+    local accel; accel="$(printf '%s\n' "$raw" | grep -E "^\[$SESSION\]" | sed -n 's/.*Hardware: \([^ ]*\).*/\1/p')"
     if [ -n "$accel" ] && [ "$accel" != "$GPU" ]; then
       warn "会话 $SESSION 是 $accel, 需要 $GPU → 重建"
       vm_cmd "bash $SRC_DIR/remote/supervisor.sh stop" >/dev/null 2>&1 || true
-      RUN_TO 180 colab stop -s "$SESSION" >/dev/null 2>&1 || true
+      colab_to 180 stop -s "$SESSION" >/dev/null 2>&1 || true
       FORCE=1
     elif [ "$FORCE" = 0 ]; then
       ok "会话 $SESSION 已在 ($accel)"
@@ -208,13 +283,27 @@ session_ensure() {
     fi
   fi
   say "创建 Colab 会话 $SESSION ($GPU) ..."
-  RUN_TO 900 colab new --gpu "$GPU" -s "$SESSION" || die "创建会话失败"
+  local out
+  out="$(colab_to 900 new --gpu "$GPU" -s "$SESSION" 2>&1)" || true
+  printf '%s\n' "$out" | sed 's/^/  /'
+  # 免费额度下 GPU 分配经常被临时拒绝 (TooManyAssignments / 容量): 退避重试几次
+  local attempt=1
+  while printf '%s\n' "$out" | grep -qi 'Allocation refused\|precondition failed\|TooManyAssignments'; do
+    [ "$attempt" -ge 4 ] && die "创建会话失败: 连续 $attempt 次被拒。先释放别的会话 (colab stop), 或稍后重试。"
+    local wait=$((attempt * 30))
+    warn "分配被拒, ${wait}s 后重试 ($attempt/3) ..."
+    sleep "$wait"
+    attempt=$((attempt + 1))
+    out="$(colab_to 900 new --gpu "$GPU" -s "$SESSION" 2>&1)" || true
+    printf '%s\n' "$out" | sed 's/^/  /'
+  done
+  printf '%s\n' "$out" | grep -qi 'READY\|created\|Creating' || die "创建会话失败"
   event "session created $SESSION $GPU"
 }
 
-# 本地 → VM 的用户级同步 (driver + env 文件)
+# 本地机器 → VM 的驱动脚本注入 (driver + env 文件)
 sync_vm() {
-  write_driver; vm_run "$VM_DRIVER" | tail -1
+  write_driver; vm_run_file "$VM_DRIVER" | tail -1
   refresh_env
 }
 
@@ -253,9 +342,9 @@ refresh_env() {
   cat > "$VM_ENV" <<EOF
 # source 这个文件后可以直接操作远端网关
 VM_SESSION='$SESSION'; VM_ROOT='$ROOT'; VM_REPO='$REPO_DIR'; PUBLIC_URL='$url'
-csg_status() { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" status; }
-csg_logs()   { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" logs "\${1:-20}"; }
-csg_url()    { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" url; }
+csg_status() { printf 'bash "%s/src/remote/supervisor.sh" status\n' "\$VM_ROOT" | colab exec -s "\$VM_SESSION"; }
+csg_logs()   { printf 'bash "%s/src/remote/supervisor.sh" logs %s\n' "\$VM_ROOT" "\${1:-20}" | colab exec -s "\$VM_SESSION"; }
+csg_url()    { printf 'bash "%s/src/remote/supervisor.sh" url\n' "\$VM_ROOT" | colab exec -s "\$VM_SESSION"; }
 csg_health() { curl -s "\$PUBLIC_URL/health"; }
 EOF
   # 远端路径与本次部署无关的部分 (--root 等) 一旦变化就重新注入驱动
@@ -366,7 +455,7 @@ cmd_down() {
   remote_supervisor stop | sed 's/^/  /'
   ok "服务已停"
   if [ "$STOP_SESSION" = 1 ]; then
-    RUN_TO 240 colab stop -s "$SESSION" >/dev/null 2>&1 && ok "会话 $SESSION 已释放" || warn "会话停止失败"
+    colab_to 240 stop -s "$SESSION" >/dev/null 2>&1 && ok "会话 $SESSION 已释放" || warn "会话停止失败"
     rm -f "$URL_FILE"; refresh_env; event "session stopped"
   else
     dim "Colab 会话仍在 (想连会话一起释放: --stop-session)"
@@ -377,7 +466,7 @@ cmd_restart() {
   need_colab
   warn "重建会话并拉起服务 ..."
   remote_supervisor stop >/dev/null 2>&1 || true
-  RUN_TO 240 colab stop -s "$SESSION" >/dev/null 2>&1 || true
+  colab_to 240 stop -s "$SESSION" >/dev/null 2>&1 || true
   rm -f "$URL_FILE"
   FORCE=1
   cmd_up
@@ -388,12 +477,17 @@ cmd_restart() {
 # --------------------------------------------------------------------------
 cmd_status() {
   need_colab
-  if ! session_exists; then
+  sessions_capture
+  if [ -z "$SESSIONS_OUT" ] && [ "$SESSIONS_RC" -ne 0 ]; then
+    warn "查询会话失败 (colab sessions 超时); 检查网络/代理 (CSG_PROXY)"
+    return 1
+  fi
+  if ! printf '%s\n' "$SESSIONS_OUT" | grep -qE "^\[$SESSION\]"; then
     warn "会话 $SESSION 不存在 (colab-sg up)"
     [ -s "$URL_FILE" ] && dim "上次地址(已失效): $(cat "$URL_FILE")"
     return 1
   fi
-  RUN_TO 90 colab status -s "$SESSION" 2>/dev/null | sed 's/^/  /'
+  colab_to 90 status -s "$SESSION" 2>/dev/null | sed 's/^/  /'
   dim "  ── 服务 ──"
   remote_supervisor status 2>/dev/null | sed 's/^/  /'
   [ -s "$URL_FILE" ] && ok "  公网地址: $(cat "$URL_FILE")"
@@ -409,7 +503,7 @@ cmd_url() {
 }
 
 cmd_logs()   { need_colab; remote_supervisor "logs ${1:-20}" 2>/dev/null; }
-cmd_exec()   { need_colab; [ $# -gt 0 ] || die "用法: colab-sg exec <命令...>"; printf '%s\n' "$*" | vm_run /dev/stdin; }
+cmd_exec()   { need_colab; [ $# -gt 0 ] || die "用法: colab-sg exec <命令...>"; printf '%s\n' "$*" | vm_run; }
 
 notify() {
   if command -v osascript >/dev/null 2>&1; then
@@ -426,7 +520,10 @@ cmd_watch() {
   need_colab
   say "保活中 (每 ${WATCH_INTERVAL}s 自检; 常驻请用 colab-sg service install)"
   while true; do
-    if ! session_exists; then
+    sessions_capture
+    if [ -z "$SESSIONS_OUT" ] && [ "$SESSIONS_RC" -ne 0 ]; then
+      warn "查不到会话列表 (colab sessions 超时) —— 网络/代理问题, 本轮跳过"
+    elif ! printf '%s\n' "$SESSIONS_OUT" | grep -qE "^\[$SESSION\]"; then
       warn "会话 $SESSION 不在 → 重建"
       event "session lost, rebuilding"
       notify "Colab 会话断开" "正在重建 $SESSION"
@@ -447,10 +544,12 @@ cmd_watch() {
 }
 
 cmd_service() {
-  local action="${1:-install}" self="$SELF_DIR/$(basename "${BASH_SOURCE[0]:-$0}")"
+  local action="${1:-install}"
+  local self="$SELF_DIR/$(basename "${BASH_SOURCE[0]:-$0}")"
   local -a args=(-s "$SESSION" -g "$GPU" --port "$PORT" --root "$ROOT" --interval "$WATCH_INTERVAL")
   [ "$TUNNEL_MODE" = "off" ] && args+=(--no-tunnel)
   [ -n "$TUNNEL_NAME" ] && args+=(-n "$TUNNEL_NAME")
+  [ -n "$PROXY" ] && args+=(--proxy "$PROXY")
   [ -n "${ON_URL_CHANGE:-}" ] && args+=(--on-url-change "$ON_URL_CHANGE")
   case "$action" in
     install)
@@ -555,12 +654,12 @@ cmd_doctor() {
   printf '  平台              %s %s\n' "$(uname -s)" "$(uname -m)"
   printf '  colab CLI         %s\n' "$(command -v colab || echo '缺失 → uv tool install google-colab-cli')"
   printf '  timeout           %s\n' "$(command -v timeout || echo '缺失(可选, 只是少了 exec 兜底超时)')"
-  printf '  会话              %s\n' "$(sessions_raw | tr '\n' ' ' || echo 查询失败)"
+  printf '  会话              %s\n' "$(sessions_capture; printf '%s' "$SESSIONS_OUT" | tr '\n' ' ' || echo 查询失败)"
   printf '  remote/ 源        %s\n' "$([ -d "$SRC_REMOTE" ] && echo "$SRC_REMOTE" || echo 缺失)"
   printf '  Cloudflare token  %s\n' "$([ -s "$CF_TOKEN_FILE" ] && echo "$CF_TOKEN_FILE" || echo '未配置 (quick tunnel 不需要)')"
   printf '  状态目录          %s\n' "$STATE_DIR"
   printf '  上次公网地址      %s\n' "$([ -s "$URL_FILE" ] && cat "$URL_FILE" || echo '(无)')"
-  command -v colab >/dev/null 2>&1 && RUN_TO 90 colab usage 2>/dev/null | sed 's/^/  /'
+  command -v colab >/dev/null 2>&1 && colab_to 90 usage 2>/dev/null | sed 's/^/  /'
 }
 
 # --------------------------------------------------------------------------
