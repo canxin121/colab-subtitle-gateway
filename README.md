@@ -202,6 +202,15 @@ templates/              launchd plist 与 systemd unit 模板
 | `CSG_EXEC_TIMEOUT` | `180` | 单次 `colab exec` 墙钟上限 |
 | `CSG_WATCH_INTERVAL` | `120` | `watch` 自检间隔（秒） |
 
+## 卸载
+
+```bash
+colab-sg down --stop-session    # 停服务 + 释放 Colab 会话
+colab-sg service uninstall      # 移除 launchd / systemd 单元
+./install.sh --uninstall        # 摘掉 ~/.local/bin 里的入口
+rm -rf ~/.local/state/colab-subtitle-gateway ~/.config/colab-subtitle-gateway
+```
+
 ## 许可
 
 MIT
