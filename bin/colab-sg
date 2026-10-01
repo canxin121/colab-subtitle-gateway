@@ -215,9 +215,12 @@ vm_launch() {  # $1 本地脚本  $2 任务名
     echo "chmod +x '$rscript'; rm -f '$rdone'"
     echo "setsid nohup bash -c 'bash \"$rscript\"; echo \$? > \"$rdone\"' > '$rlog' 2>&1 < /dev/null &"
     echo "sleep 2"
-    echo "pgrep -f '$name.sh' >/dev/null || { echo 'LAUNCH_FAILED (看 $rlog)'; exit 1; }"
-    echo "echo LAUNCHED"
-  } | vm_run
+    # 任务可能在 sleep 期间就跑完了 (例如 up: 网关和隧道都已在), 这时进程不在了
+    # 但 .done 在, 是正常收尾而不是启动失败。
+    echo "if pgrep -f '$name.sh' >/dev/null; then echo LAUNCHED"
+    echo "elif [ -f '$rdone' ]; then echo \"LAUNCHED (已结束, rc=\$(cat '$rdone'))\""
+    echo "else echo 'LAUNCH_FAILED (看 $rlog)'; exit 1; fi"
+  } | vm_run || true   # 启动失败也走我们自己的 LAUNCH_FAILED 文案, 不要 colab 的 traceback
 }
 
 # 轮询长任务: 心跳日志打屏; 结束返回任务退出码
