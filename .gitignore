@@ -6,6 +6,12 @@
 cloudflare.token
 *.token
 .env
+# 注意 `.env` 这个通配**匹配不到** secrets.env (gitignore 的通配不含前缀匹配),
+# 所以显式列出; 配置文件里可能有内网地址/主机名, 一并排除。
+secrets.env
+config.sh
+*.selected.json
+models.upstream.json
 
 # 编辑器 / 系统
 .DS_Store

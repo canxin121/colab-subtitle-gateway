@@ -22,20 +22,15 @@
   <key>Label</key>
   <string>com.colab-subtitle-gateway</string>
 
-  <!-- __EXEC__ 替换成 bin/colab-sg 的绝对路径; 参数按需增删 -->
+  <!-- __EXEC__ 替换成 bin/colab-sg 的绝对路径。
+       参数只剩 watch: 会话名/GPU/端口/模型/协议/隧道这些设置都在
+       ~/.config/colab-subtitle-gateway/config.sh 里, 脚本启动时会自己读,
+       所以改了配置不用重装这个 plist。 -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>__EXEC__</string>
     <string>watch</string>
-    <string>-s</string>
-    <string>colab-sg</string>
-    <string>-g</string>
-    <string>T4</string>
-    <string>--port</string>
-    <string>8000</string>
-    <string>--interval</string>
-    <string>120</string>
   </array>
 
   <key>EnvironmentVariables</key>

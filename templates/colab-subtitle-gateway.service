@@ -29,8 +29,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# __EXEC__ 换成 bin/colab-sg 的绝对路径; 参数按需增删
-ExecStart=__EXEC__ watch -s colab-sg -g T4 --port 8000 --interval 120
+# __EXEC__ 换成 bin/colab-sg 的绝对路径。
+# 参数只剩 watch: 会话名/GPU/端口/模型/协议/隧道这些设置都在
+# ~/.config/colab-subtitle-gateway/config.sh 里, 脚本启动时自己读, 改配置不用重装单元。
+ExecStart=__EXEC__ watch
 
 Restart=always
 RestartSec=30

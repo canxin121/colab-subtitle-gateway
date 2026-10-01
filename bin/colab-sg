@@ -12,10 +12,43 @@
 #      kernel 卡住或 exec 超时都不会把部署留在半路。
 set -uo pipefail
 
-CSG_VERSION="0.2.0"
+CSG_VERSION="0.4.0"
 
 # --------------------------------------------------------------------------
-# 默认配置 (环境变量可覆盖)
+# 安装位置: 必须解析软链
+# macOS 的 readlink 没有 -f, 手写循环。经 ~/.local/bin/colab-sg 软链调用时,
+# BASH_SOURCE 指向软链本身, 不解析的话 SRC_REMOTE 会指向不存在的目录,
+# write_driver 直接 die —— 也就是说软链安装下 up/service 全都跑不起来。
+# --------------------------------------------------------------------------
+_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_self" ]; do
+  _dir="$(cd "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$_self")" && pwd)"
+SELF_PATH="$SELF_DIR/$(basename "$_self")"
+SRC_REMOTE="$SELF_DIR/../remote"
+
+# --------------------------------------------------------------------------
+# 配置: ~/.config/colab-subtitle-gateway/{config.sh,secrets.env}
+# 优先级 (实测于 macOS /bin/bash 3.2.57):
+#   显式 CLI flag > 进程环境 > config.sh > 内置默认
+# 之所以是自引用的 `CSG_X="${CSG_X-v}"` 形式: 普通赋值会盖掉进程环境,
+# 而 `${X-v}` 只在 X 未设时才写值, 于是环境变量天然优先。
+# --------------------------------------------------------------------------
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/colab-subtitle-gateway"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/colab-subtitle-gateway"
+CONFIG_FILE="${CSG_CONFIG_FILE:-$CONFIG_DIR/config.sh}"
+SECRETS_FILE="${CSG_SECRETS_FILE:-$CONFIG_DIR/secrets.env}"
+# 提供 source 的路径提示 (配置文件不在仓库里, shellcheck 无法跟随)
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+# shellcheck disable=SC1090
+[ -f "$SECRETS_FILE" ] && . "$SECRETS_FILE"
+
+# --------------------------------------------------------------------------
+# 默认配置 (环境变量与 config.sh 均可覆盖)
 # --------------------------------------------------------------------------
 SESSION="${CSG_SESSION:-colab-sg}"
 GPU="${CSG_GPU:-T4}"
@@ -23,28 +56,54 @@ PORT="${CSG_PORT:-8000}"
 ROOT="${CSG_ROOT:-/content/csg}"
 EXEC_TIMEOUT="${CSG_EXEC_TIMEOUT:-180}"          # 单次 colab exec 的墙钟上限
 WATCH_INTERVAL="${CSG_WATCH_INTERVAL:-120}"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/colab-subtitle-gateway"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/colab-subtitle-gateway"
+DEVICE="${CSG_DEVICE:-cuda}"                     # auto | cuda | cpu (网关会自动回落)
+# 部署哪些模型 (空格分隔, id 来自上游 models.json)
+MODELS="${CSG_MODELS:-fun-asr-mlt-nano}"
+PRELOAD="${CSG_PRELOAD:-}"
+MAX_LOADED="${CSG_MAX_LOADED_MODELS:-}"
+PROTOCOLS="${CSG_PROTOCOLS:-openai ferrum deepl libretranslate}"
+TRANSLATE_FREE="${CSG_TRANSLATE_FREE:-google,edge}"
+TRANSLATE_UPSTREAM="${CSG_TRANSLATE_UPSTREAM:-}"
+TRANSLATE_UPSTREAM_KEY="${CSG_TRANSLATE_UPSTREAM_KEY:-}"
+LIBRETRANSLATE_UPSTREAM="${CSG_LIBRETRANSLATE_UPSTREAM:-}"
+LIBRETRANSLATE_UPSTREAM_KEY="${CSG_LIBRETRANSLATE_UPSTREAM_KEY:-}"
+# 密钥只在 secrets.env 里 (600); 这里只是接住它的值
+AUTH_SECRET="${CSG_AUTH_SECRET:-}"
+ENCRYPTION_KEY="${CSG_ENCRYPTION_KEY:-}"
+TRANSLATE_API_KEY="${CSG_TRANSLATE_API_KEY:-}"
+LIBRETRANSLATE_API_KEY="${CSG_LIBRETRANSLATE_API_KEY:-}"
+UPSTREAM_REV="${CSG_UPSTREAM_REV:-}"
 URL_FILE="$STATE_DIR/url"
 EVENTS="$STATE_DIR/events.log"
 ON_URL_CHANGE="${CSG_ON_URL_CHANGE:-}"
 CF_TOKEN_FILE="${CSG_CF_TOKEN_FILE:-$CONFIG_DIR/cloudflare.token}"
 VM_DRIVER="$STATE_DIR/driver.sh"
 UPSTREAM_REPO="${CSG_UPSTREAM:-https://github.com/canxin121/subtitle-gateway.git}"
+: "$UPSTREAM_REPO"   # 文档用: 上游地址 (setup.sh 里用的是同一份)
 # 访问 Google 需要代理的网络里, 给 colab CLI 指一个代理 (例如 http://127.0.0.1:7890)
 PROXY="${CSG_PROXY:-}"
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-SRC_REMOTE="$SELF_DIR/../remote"
-
 TUNNEL_NAME="${CSG_TUNNEL_NAME:-}"
-TUNNEL_MODE="quick"                              # quick | off (给了 -n 就是命名隧道)
-STOP_SESSION=0; FORCE=0; NO_INSTALL=0; DEMO=0; REFRESH=0
+# 固定域名的推荐做法: Cloudflare Zero Trust 里建隧道 + 配公网主机名, 拿 connector token。
+# 只要这两样, 换会话/换机器都不用重新登录 cloudflared。
+TUNNEL_HOSTNAME="${CSG_TUNNEL_HOSTNAME:-}"
+TUNNEL_TOKEN_FILE="${CSG_TUNNEL_TOKEN_FILE:-$CONFIG_DIR/tunnel.token}"
+STOP_SESSION=0; FORCE=0; NO_INSTALL=0; REFRESH=0; DRY_RUN=0; PURGE=0; ASSUME_YES=0
+# --tunnel / --no-tunnel / config.sh 都能定; 空 = 按"有 token/名字就是命名隧道"推断
+TUNNEL_MODE="${CSG_TUNNEL_MODE:-}"               # quick | named | token | off
+VM_TUNNEL_TOKEN="$ROOT/tunnel.token"             # token 送到 VM 的落点 (root only 权限)
+VM_DEPLOY_ENV="$ROOT/deploy.env"                 # VM 侧参数 (所有 exec 都是新 shell, 必须落盘)
+VM_SECRETS="$ROOT/secrets.env"                   # VM 侧密钥 (600)
+VM_SELECTED="$ROOT/models.selected.json"         # 选中的模型清单
 
 # 远端路径 (随 --root 变)
 set_paths() {
   REPO_DIR="$ROOT/repo"; SRC_DIR="$ROOT/src"; RUN_DIR="$ROOT/run"
   VM_ENV="$STATE_DIR/env.sh"
+  VM_TUNNEL_TOKEN="$ROOT/tunnel.token"
+  VM_DEPLOY_ENV="$ROOT/deploy.env"
+  VM_SECRETS="$ROOT/secrets.env"
+  VM_SELECTED="$ROOT/models.selected.json"
 }
 set_paths
 mkdir -p "$STATE_DIR"
@@ -58,6 +117,9 @@ die()  { printf '%s%s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 1; }
 dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 event(){ printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$EVENTS"; }
 
+# 协议开关 (空格分隔的 CSG_PROTOCOLS); 向导/demo/supervisor 都用同一份语义
+has_proto() { case " $PROTOCOLS " in *" $1 "*) return 0 ;; esac; return 1; }
+
 # GNU timeout 不是每个 macOS 都有
 if command -v timeout >/dev/null 2>&1; then
   RUN_TO() { timeout --foreground "$1" "${@:2}"; }
@@ -65,45 +127,79 @@ else
   RUN_TO() { shift; "$@"; }
 fi
 
+# sha256 的十六进制摘要。macOS 是 shasum, 常见 Linux 只有 sha256sum (sha256sum 在
+# macOS 上不存在), 所以两个都认。ferrum 的 x-auth-token 就是 sha256(secret) 的 hex,
+# 算错了客户端一律 401 —— 不能只挑一个。
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256hex() { sha256sum | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256hex() { shasum -a 256 | awk '{print $1}'; }
+else
+  sha256hex() { openssl dgst -sha256 | awk '{print $NF}'; }
+fi
+
 usage() { cat <<EOF
 colab-sg $CSG_VERSION — Colab GPU 上的 subtitle-gateway 服务端 + 公网入口
 
 用法: colab-sg <命令> [选项]
 
-命令:
-  setup             在 VM 上准备/更新环境 (依赖 + 下载旗舰模型), 幂等
+安装:
+  install           交互式安装向导 (登录 → 会话 → 选模型 → 选协议/密钥 → 选隧道 → 部署)
+  config            只改配置 (模型/协议/密钥/域名), 不重装依赖也不重下模型
+  upgrade           升级本地脚本 + VM 侧环境, 然后重启网关 (会话保留)
+  uninstall         卸载; --purge 连 ~/.config 与 ~/.local/state 一起清
+  login             登录 Google Colab (会打印授权 URL, 粘贴授权码)
+  tunnel login      登录 cloudflared (cert.pem 模式; 需先在 config 里设隧道名)
+  tunnel status     看当前隧道模式 / token / 固定域名
+  keygen            生成 ferrum 鉴权密钥与加密口令, 写进 secrets.env
+  models            对比"选中的模型"与 VM 上实际缓存
+
+日常:
   up                建/复用 GPU 会话 → 同步 → 起网关 + 公网隧道
   down              停服务; --stop-session 连 Colab 会话一起释放
+  reload            重启网关 + 隧道 (配置/密钥改完后用这条, **不**掉会话)
   restart           停服务 → 重建会话 → 再拉起来 (断开后的自愈入口)
   status            会话 / 网关 / 隧道 / 公网地址 一屏
   url [--refresh]   打印公网地址 (脚本友好)
   logs [n]          看 VM 上的 supervisor / gateway / tunnel 日志
   exec <命令...>    在 VM 上执行任意命令
+  setup             在 VM 上准备/更新环境 (依赖 + 模型), 幂等
   watch             常驻保活: 会话断了自动重建, 地址变了写文件 + 通知
   service install   把 watch 装成常驻服务 (macOS launchd / Linux systemd --user)
   service uninstall 卸载常驻服务
-  doctor            本地环境体检
-  demo              部署完再跑一遍端到端自测 (ASR + 翻译)
+  doctor            本地环境体检 (含当前配置摘要)
+  demo              部署完再跑一遍端到端自测 (按选中的协议跳步)
   version
 
-选项:
-  -s, --session NAME    会话名          (默认 \$CSG_SESSION 或 colab-sg)
-  -g, --gpu VARIANT     GPU 型号        (默认 \$CSG_GPU 或 T4; L4/A100/H100/G4 亦可)
-      --port N          网关端口        (默认 8000)
-      --root PATH       VM 上的根目录   (默认 /content/csg)
-      --tunnel          开公网隧道       (默认)
-      --no-tunnel       不开隧道
-  -n, --tunnel-name N   命名隧道名, 域名固定 (需 Cloudflare API Token)
-      --cf-token-file F Cloudflare API Token 文件 (默认 \$CONFIG_DIR/cloudflare.token)
+选项 (优先于 config.sh 与环境变量):
+  -s, --session NAME    会话名            (默认 \$CSG_SESSION 或 colab-sg)
+  -g, --gpu VARIANT     GPU 型号          (默认 \$CSG_GPU 或 T4; L4/A100/H100/G4 亦可)
+      --port N          网关端口          (默认 8000)
+      --root PATH       VM 上的根目录     (默认 /content/csg)
+      --device D        设备 cuda|auto|cpu (默认 cuda; 显式设备不可用时网关会回落 cpu)
+      --models "A B"    部署哪些模型 (id 来自上游 models.json, 空格分隔)
+      --preload "A"     启动预载哪个
+      --max-loaded-models N  最多常驻几个 (0=不限)
+      --protocols "openai ferrum deepl libretranslate"
+      --translate-free "google,edge"  免费翻译源 (none = 关掉翻译端点)
+      --tunnel-mode M   quick|token|named|off
+      --tunnel / --no-tunnel
+  -n, --tunnel-name N   命名隧道名 (cert.pem 模式, 需先 colab-sg tunnel login)
+      --tunnel-hostname H  固定域名的主机名 (token 模式必需, 如 asr.example.com)
+      --tunnel-token-file F  命名隧道的 connector token 文件 (默认 \$CONFIG_DIR/tunnel.token)
+      --cf-token-file F Cloudflare API Token 文件 (可选)
+      --config-file F   配置文件路径 (默认 \$CONFIG_DIR/config.sh)
       --timeout N       单次 colab exec 超时秒数 (默认 180)
       --proxy URL       访问 Google 走的代理 (如 http://127.0.0.1:7890); 也可用 \$CSG_PROXY
-                        (没有时自动读环境里的 HTTPS_PROXY)
       --interval N      watch: 保活间隔秒数 (默认 120)
       --on-url-change C watch: 地址变化时执行 C (新地址在 \$CSG_URL)
       --refresh         url: 强制回 VM 重读一次地址 (也接受 url --refresh)
   -f, --force           setup: 强制重装依赖; up: 强制重建会话
       --no-install      up: 环境不全时不要自动补装, 直接失败
       --stop-session    down: 连 Colab 会话一起释放
+      --dry-run         install/config: 只打印将要执行的动作, 不碰 VM
+      --purge           uninstall: 连配置与状态目录一起清
+  -y, --yes             非交互: 全部取默认值 (CI 用)
   -h, --help
 EOF
 }
@@ -118,14 +214,29 @@ while [ $# -gt 0 ]; do
     -g|--gpu)          GPU="$2"; shift 2 ;;
     --port)            PORT="$2"; shift 2 ;;
     --root)            ROOT="$2"; set_paths; shift 2 ;;
+    --device)          DEVICE="$2"; shift 2 ;;
+    --models)          MODELS="$2"; shift 2 ;;
+    --preload)         PRELOAD="$2"; shift 2 ;;
+    --max-loaded-models) MAX_LOADED="$2"; shift 2 ;;
+    --protocols)       PROTOCOLS="$2"; shift 2 ;;
+    --translate-free)  TRANSLATE_FREE="$2"; shift 2 ;;
     --tunnel)          TUNNEL_MODE="quick"; shift ;;
     --no-tunnel)       TUNNEL_MODE="off"; shift ;;
     -n|--tunnel-name)  TUNNEL_NAME="$2"; shift 2 ;;
     --cf-token-file)   CF_TOKEN_FILE="$2"; shift 2 ;;
+    --config-file)     CONFIG_FILE="$2"
+                       # shellcheck disable=SC1090
+                       [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"; shift 2 ;;
     --timeout)         EXEC_TIMEOUT="$2"; shift 2 ;;
     --proxy)           PROXY="$2"; shift 2 ;;
     --interval)        WATCH_INTERVAL="$2"; shift 2 ;;
+    --tunnel-hostname) TUNNEL_HOSTNAME="$2"; shift 2 ;;
+    --tunnel-token-file) TUNNEL_TOKEN_FILE="$2"; shift 2 ;;
+    --tunnel-mode)     TUNNEL_MODE="$2"; shift 2 ;;
     --refresh)         REFRESH=1; shift ;;   # url: 强制回 VM 重新读一次地址
+    --dry-run)         DRY_RUN=1; shift ;;
+    --purge)           PURGE=1; shift ;;
+    --yes|-y)          ASSUME_YES=1; shift ;;
     --on-url-change)   ON_URL_CHANGE="$2"; shift 2 ;;
     -f|--force)        FORCE=1; shift ;;
     --no-install)      NO_INSTALL=1; shift ;;
@@ -137,6 +248,7 @@ while [ $# -gt 0 ]; do
 done
 case "$CMD" in
   service) CMD="service:${ARGS[0]:-install}" ;;
+  tunnel)  CMD="tunnel:${ARGS[0]:-status}";  ARGS=("${ARGS[@]:1}") ;;
   demo)    CMD="demo" ;;
 esac
 
@@ -314,10 +426,42 @@ sync_vm() {
   refresh_env
 }
 
-# driver: 把 remote/* 注入 VM, 并导出本次部署的参数
+# deploy.env 的内容: VM 侧所有非密钥参数。必须以文件形式落盘 —— colab exec 每次
+# 都是新的 bash, 在 driver 里 export 的东西活不过那个 cell, supervisor/setup 只能读默认值。
+deploy_env_lines() {
+  printf "CSG_ROOT='%s'\n"              "$ROOT"
+  printf "CSG_PORT='%s'\n"              "$PORT"
+  printf "CSG_DEVICE='%s'\n"            "$DEVICE"
+  printf "CSG_PRELOAD='%s'\n"           "$PRELOAD"
+  printf "CSG_MAX_LOADED_MODELS='%s'\n" "$MAX_LOADED"
+  printf "CSG_PROTOCOLS='%s'\n"         "$PROTOCOLS"
+  printf "CSG_TRANSLATE_FREE='%s'\n"    "$TRANSLATE_FREE"
+  printf "CSG_TRANSLATE_UPSTREAM='%s'\n" "$TRANSLATE_UPSTREAM"
+  printf "CSG_LIBRETRANSLATE_UPSTREAM='%s'\n" "$LIBRETRANSLATE_UPSTREAM"
+  printf "CSG_TUNNEL_MODE='%s'\n"       "$TUNNEL_MODE"
+  printf "CSG_TUNNEL_NAME='%s'\n"       "$TUNNEL_NAME"
+  printf "CSG_TUNNEL_HOSTNAME='%s'\n"   "$TUNNEL_HOSTNAME"
+  printf "CSG_TUNNEL_TOKEN_FILE='%s'\n" "$VM_TUNNEL_TOKEN"
+  printf "CSG_UV_INDEX='%s'\n"          "${CSG_UV_INDEX:-}"
+  printf "CSG_MODELS='%s'\n"            "$MODELS"
+  printf "MODELSCOPE_CACHE='%s'\n"      "$REPO_DIR/models_cache"
+  printf "HF_HOME='%s'\n"               "$REPO_DIR/models_cache"
+}
+
+# 密钥文件内容 (只经 vm_put 的 stdin 送进 VM, 不落本地 state 目录)
+secrets_env_lines() {
+  printf "CSG_AUTH_SECRET='%s'\n"                "$AUTH_SECRET"
+  printf "CSG_ENCRYPTION_KEY='%s'\n"             "$ENCRYPTION_KEY"
+  printf "CSG_TRANSLATE_API_KEY='%s'\n"          "$TRANSLATE_API_KEY"
+  printf "CSG_TRANSLATE_UPSTREAM_KEY='%s'\n"     "$TRANSLATE_UPSTREAM_KEY"
+  printf "CSG_LIBRETRANSLATE_API_KEY='%s'\n"     "$LIBRETRANSLATE_API_KEY"
+  printf "CSG_LIBRETRANSLATE_UPSTREAM_KEY='%s'\n" "$LIBRETRANSLATE_UPSTREAM_KEY"
+}
+
+# driver: 把 remote/* 注入 VM, 并把本次部署的参数落成 $ROOT/deploy.env
 write_driver() {
   local f
-  for f in models.json setup.sh supervisor.sh; do
+  for f in setup.sh supervisor.sh; do
     [ -s "$SRC_REMOTE/$f" ] || die "缺少 $SRC_REMOTE/$f —— 本脚本依赖同仓库的 remote/ 目录"
   done
   {
@@ -325,23 +469,31 @@ write_driver() {
     echo '# colab-sg 远端驱动 (本地生成)'
     echo "CSG_ROOT='$ROOT'; SRC='$SRC_DIR'"
     echo 'mkdir -p "$SRC/remote" "$CSG_ROOT/run"'
-    for f in models.json setup.sh supervisor.sh; do
+    for f in setup.sh supervisor.sh; do
       echo "base64 -d > '$SRC_DIR/remote/$f' <<'__CSG_B64__'"
       base64 < "$SRC_REMOTE/$f" | tr -d '\n'; echo
       echo '__CSG_B64__'
       echo "chmod +x '$SRC_DIR/remote/$f'"
     done
-    echo "export CSG_ROOT='$ROOT'"
-    echo "export CSG_PORT='$PORT'"
-    echo "export CSG_TUNNEL_MODE='$TUNNEL_MODE'"
-    echo "export CSG_TUNNEL_NAME='$TUNNEL_NAME'"
-    echo "export CSG_UV_INDEX='${CSG_UV_INDEX:-}'"
-    echo "export MODELSCOPE_CACHE='$REPO_DIR/models_cache'"
-    echo "export HF_HOME='$REPO_DIR/models_cache'"
-    # 单模型清单是"跑哪个模型"的唯一声明, 覆盖掉仓库里那份 (网关与下载脚本都读它)
-    echo "[ -d '$REPO_DIR' ] && cp '$SRC_DIR/remote/models.json' '$REPO_DIR/models.json'"
+    echo "cat > '$VM_DEPLOY_ENV' <<'__CSG_ENV__'"
+    deploy_env_lines
+    echo '__CSG_ENV__'
+    echo "chmod 600 '$VM_DEPLOY_ENV'"
     echo 'echo "[vm] driver ready"'
   } > "$VM_DRIVER"
+}
+
+# 配置指纹: 配置 / 选择 / 密钥 / remote 脚本 任一变化都要重新注入驱动与参数
+fingerprint() {
+  {
+    cat "$CONFIG_FILE" 2>/dev/null
+    cat "$SRC_REMOTE/setup.sh" "$SRC_REMOTE/supervisor.sh" 2>/dev/null
+    printf '%s\n' "$MODELS|$PRELOAD|$DEVICE|$PORT|$ROOT|$PROTOCOLS|$MAX_LOADED"
+    printf '%s\n' "$TRANSLATE_FREE|$TRANSLATE_UPSTREAM|$LIBRETRANSLATE_UPSTREAM"
+    printf '%s\n' "$TUNNEL_MODE|$TUNNEL_NAME|$TUNNEL_HOSTNAME|$TUNNEL_TOKEN_FILE"
+    printf '%s\n' "$AUTH_SECRET$ENCRYPTION_KEY$TRANSLATE_API_KEY$LIBRETRANSLATE_API_KEY"
+    [ -s "$TUNNEL_TOKEN_FILE" ] && cat "$TUNNEL_TOKEN_FILE"
+  } | sha256hex 2>/dev/null
 }
 
 refresh_env() {
@@ -354,12 +506,74 @@ csg_logs()   { printf 'bash "%s/src/remote/supervisor.sh" logs %s\n' "\$VM_ROOT"
 csg_url()    { printf 'bash "%s/src/remote/supervisor.sh" url\n' "\$VM_ROOT" | colab exec -s "\$VM_SESSION"; }
 csg_health() { curl -s "\$PUBLIC_URL/health"; }
 EOF
-  # 远端路径与本次部署无关的部分 (--root 等) 一旦变化就重新注入驱动
-  if [ ! -f "$STATE_DIR/.synced" ] || ! grep -qF "root=$ROOT" "$STATE_DIR/.synced" 2>/dev/null; then
+  # 指纹变了 (改了配置/密钥/remote 脚本) 就重新注入驱动; 否则每次 up 都白跑一次 exec
+  local fp; fp="$(fingerprint)"
+  if [ ! -f "$STATE_DIR/.synced" ] || ! grep -qF "fp=$fp" "$STATE_DIR/.synced" 2>/dev/null; then
     write_driver
+    printf 'session=%s root=%s port=%s gpu=%s tunnel=%s name=%s models=%s fp=%s\n' \
+      "$SESSION" "$ROOT" "$PORT" "$GPU" "$TUNNEL_MODE" "$TUNNEL_NAME" "$MODELS" "$fp" \
+      > "$STATE_DIR/.synced"
   fi
-  printf 'session=%s root=%s port=%s gpu=%s tunnel=%s name=%s\n' \
-    "$SESSION" "$ROOT" "$PORT" "$GPU" "$TUNNEL_MODE" "$TUNNEL_NAME" > "$STATE_DIR/.synced"
+}
+
+# 选中的模型清单送到 VM: 从上游 manifest 里挑出选中的 id 写成 $ROOT/models.selected.json。
+# 过滤在 VM 上用 python3 做 (不要在 bash 里手搓 JSON)。
+# 顺带把"上游已删掉的 id"剔除并告警 —— --preload 传未知 id 会让网关直接崩。
+SELECTED_PY='
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]); want = sys.argv[2].split(); preload = sys.argv[3]
+# 必须读**上游**清单: repo/models.json 在装好之后已经被上一次的选择覆盖过了,
+# 拿它求交集就只能缩小选择, 再也加不回新模型 (上游新增的 id 也看不见)。
+up = root / "models.upstream.json"
+src = up if up.is_file() else root / "repo" / "models.json"
+try:
+    m = json.loads(src.read_text())
+except Exception as exc:
+    print("SELECTED_FAIL manifest: %s" % exc); raise SystemExit(0)
+models = m.get("models", {})
+kept = [k for k in models if k in want]
+dropped = [k for k in want if k not in models]
+if not kept:
+    print("SELECTED_FAIL 选中项在上游清单里都不存在: %s" % ",".join(dropped)); raise SystemExit(0)
+out = {"_comment": "由 colab-sg 生成: 只保留选中的模型", "preload": [preload] if preload in kept else [kept[0]], "models": {k: models[k] for k in models if k in kept}}
+(root / "models.selected.json").write_text(json.dumps(out, ensure_ascii=False, indent=2))
+print("SELECTED_OK kept=%s preload=%s%s" % (",".join(kept), out["preload"][0], (" dropped=" + ",".join(dropped)) if dropped else ""))
+'
+push_selected_manifest() {
+  [ -n "$MODELS" ] || return 0
+  [ "$DRY_RUN" = 1 ] && { dim "  [dry-run] 生成 $VM_SELECTED (选中: $MODELS)"; return 0; }
+  local out
+  out="$(vm_cmd "cat > /tmp/csg-selected.py <<'__PY__'
+$SELECTED_PY
+__PY__
+python3 /tmp/csg-selected.py '$ROOT' '$MODELS' '${PRELOAD:-}'")"
+  case "$out" in
+    *SELECTED_OK*)   dim "  $(printf '%s\n' "$out" | grep -o 'SELECTED_OK.*')" ;;
+    *SELECTED_FAIL*) warn "  $(printf '%s\n' "$out" | grep -o 'SELECTED_FAIL.*')" ;;
+    *)               warn "  选中清单生成失败 (远端无 python3 或 repo 未克隆?)" ;;
+  esac
+}
+
+# 命名隧道的 token: 只从本地文件经 colab exec 的 stdin 送进 VM, 写在 deploy 根目录
+# (root only), 不进仓库也不进日志。
+push_tunnel_token() {
+  [ -s "$TUNNEL_TOKEN_FILE" ] || return 0
+  [ "$DRY_RUN" = 1 ] && { dim "  [dry-run] 送隧道 token → $VM_TUNNEL_TOKEN"; return 0; }
+  local cur=""
+  cur="$(vm_cmd "cat '$VM_TUNNEL_TOKEN' 2>/dev/null | cut -c1-12" 2>/dev/null | tr -d '\r\n ')"
+  local want; want="$(cut -c1-12 < "$TUNNEL_TOKEN_FILE")"
+  if [ -n "$cur" ] && [ "$cur" = "$want" ]; then dim "  隧道 token 已在 VM 上"; return 0; fi
+  vm_put "$TUNNEL_TOKEN_FILE" "$VM_TUNNEL_TOKEN" >/dev/null 2>&1 \
+    && dim "  隧道 token → $VM_TUNNEL_TOKEN" || warn "隧道 token 注入失败 (固定域名不会生效)"
+}
+
+# 密钥: 只经 vm_put 的 stdin 落 $ROOT/secrets.env (600), 不写本地 state 目录、不进日志
+push_secrets() {
+  local tmp="$STATE_DIR/.secrets.push"
+  ( umask 077; secrets_env_lines > "$tmp" )
+  if [ "$DRY_RUN" = 1 ]; then dim "  [dry-run] 送密钥 → $VM_SECRETS"; rm -f "$tmp"; return 0; fi
+  vm_put "$tmp" "$VM_SECRETS" >/dev/null 2>&1 && dim "  密钥 → $VM_SECRETS" || warn "密钥注入失败"
+  rm -f "$tmp"
 }
 
 # --------------------------------------------------------------------------
@@ -371,29 +585,41 @@ assess_vm() {
   local chk; chk="$(vm_cmd "bash $SRC_DIR/remote/setup.sh --check")"
   printf '%s\n' "$chk" | sed 's/^/  /'
   NEED_DEPS=0; NEED_MODELS=0
-  if [ "$FORCE" = 1 ] || grep -qE 'MISSING|cuda: +False' <<<"$chk"; then NEED_DEPS=1; fi
-  # 缓存得是 G 级的才算下全 (旗舰模型 2GB + VAD)
-  case "$chk" in
-    *"models_cache: MISSING"*) NEED_MODELS=1 ;;
-    *"models_cache: "*G*)       NEED_MODELS=0 ;;
-    *)                          NEED_MODELS=1 ;;
-  esac
+  # 只看 setup.sh 自己给的机器可读结论: "cuda: False" / 目录大小的启发式在
+  # 可配 --device、多模型选择下必然误判 (cpu 部署永远判缺依赖, 小模型缓存判未就绪)。
+  local ready; ready="$(printf '%s\n' "$chk" | sed -n 's/^READY: //p' | tail -1)"
+  if [ -z "$ready" ]; then
+    warn "  远端没给出 READY 结论 —— remote/setup.sh 版本过旧? 按「依赖缺失」处理"
+    NEED_DEPS=1; NEED_MODELS=1
+  else
+    [ "$FORCE" = 1 ] && NEED_DEPS=1
+    case "$ready" in *"deps=missing"*) NEED_DEPS=1 ;; esac
+    case "$ready" in *"models=missing"*) NEED_MODELS=1 ;; esac
+    case "$ready" in *"models="*) ;; *) NEED_MODELS=1 ;; esac
+  fi
   printf '%s\n' "$chk" > "$STATE_DIR/last-check.txt"
+  # 上游 HEAD 记下来 (upgrade 前后对比行为变化)
+  local rev; rev="$(printf '%s\n' "$ready" | sed -n 's/.*rev=\([^ ]*\).*/\1/p')"
+  [ -n "$rev" ] && [ "$rev" != "-" ] && UPSTREAM_REV="$rev"
 }
 
 cmd_setup() {
   need_colab; session_ensure; sync_vm
+  push_tunnel_token; push_secrets; push_selected_manifest
   assess_vm
   if [ "$NEED_DEPS" = 0 ] && [ "$NEED_MODELS" = 0 ]; then
     ok "环境已就绪 (想强制重装加 -f)"; return 0
   fi
 
+  local cl=""; [ "$NEED_DEPS" = 1 ] && cl="--deps"; [ "$NEED_MODELS" = 1 ] && cl="--models"
+  [ "$NEED_DEPS" = 1 ] && [ "$NEED_MODELS" = 1 ] && cl="--all"
+
   {   # 一步到位: 后台跑, 轮询日志
     echo '#!/bin/bash'
-    echo "export CSG_ROOT='$ROOT' CSG_SEED_CACHE='${CSG_SEED_CACHE:-}'"
-    echo "[ '$NEED_DEPS' = 1 ] && [ '$NEED_MODELS' = 1 ] && bash $SRC_DIR/remote/setup.sh"
-    echo "[ '$NEED_DEPS' = 1 ] && [ '$NEED_MODELS' = 0 ] && bash $SRC_DIR/remote/setup.sh --deps"
-    echo "[ '$NEED_DEPS' = 0 ] && [ '$NEED_MODELS' = 1 ] && bash $SRC_DIR/remote/setup.sh --models"
+    echo "[ -f '$VM_DEPLOY_ENV' ] && . '$VM_DEPLOY_ENV'"
+    # setup.sh 读 deploy.env 做 CSG_MODELS; 不能用环境变量 CSG_MODELS(会和 deploy.env 里的名单冲突)
+    echo "export CSG_SEED_CACHE='${CSG_SEED_CACHE:-}'"
+    echo "bash $SRC_DIR/remote/setup.sh $cl"
     echo 'exit 0'
   } > "$STATE_DIR/setup-job.sh"
 
@@ -411,6 +637,7 @@ remote_supervisor() { vm_cmd "bash $SRC_DIR/remote/supervisor.sh $*"; }
 
 cmd_up() {
   need_colab; session_ensure; sync_vm
+  push_tunnel_token; push_secrets; push_selected_manifest
 
   assess_vm
   if [ "$NEED_DEPS" = 1 ] || [ "$NEED_MODELS" = 1 ]; then
@@ -434,6 +661,17 @@ cmd_up() {
   vm_wait up 1800 'gateway|tunnel|PUBLIC|url|UP' >/dev/null 2>&1
   remote_supervisor status | sed 's/^/  /'
   wait_public_url 300
+}
+
+# 升级 / 改完配置之后拉起服务。故意**不**掉会话: cert.pem 模式的 cert.pem 只活在 VM 的
+# 家目录里, 会话一回收就得重新 `colab-sg tunnel login`。重建会话是 cmd_restart 的语义,
+# 不是这里的。
+cmd_reload() {
+  need_colab; session_ensure; sync_vm
+  push_tunnel_token; push_secrets; push_selected_manifest
+  remote_supervisor stop >/dev/null 2>&1 || true
+  rm -f "$URL_FILE"
+  cmd_up
 }
 
 wait_public_url() {
@@ -529,7 +767,13 @@ cmd_url() {
 }
 
 cmd_logs()   { need_colab; remote_supervisor "logs ${1:-20}" 2>/dev/null; }
-cmd_exec()   { need_colab; [ $# -gt 0 ] || die "用法: colab-sg exec <命令...>"; printf '%s\n' "$*" | vm_run; }
+cmd_exec()   {
+  need_colab; [ $# -gt 0 ] || die "用法: colab-sg exec <命令...>"
+  # 允许直接粘贴文档里的 `colab-sg exec '%%bash ...'`: vm_run 会自己补魔法头,
+  # 不然会变成 cell 里的一行 Python 注释。
+  local c="$*"; c="${c#%%bash}"; c="${c# }"
+  printf '%s\n' "$c" | vm_run
+}
 
 notify() {
   if command -v osascript >/dev/null 2>&1; then
@@ -537,6 +781,84 @@ notify() {
   elif command -v notify-send >/dev/null 2>&1; then
     notify-send "$1" "$2" >/dev/null 2>&1
   fi
+}
+
+# --------------------------------------------------------------------------
+# 交互向导的原语
+# --------------------------------------------------------------------------
+# 交互原语。
+# 读: stdin 是终端时读 /dev/tty —— 向导中途会跑 colab exec, 那会把 stdin 吃掉,
+# 所以交互输入不能走 stdin。stdin 被重定向时 (测试里 `printf '...' | colab-sg config`)
+# 才从 stdin 读。
+# 写: 同理 —— 终端里写 /dev/tty (输出干净), 管道里写 stdout (测试能看到提示)。
+_prompt() {  # $1 = 末尾要不要换行 (n = 不换)
+  if [ -t 0 ]; then printf '%s' "$2" > /dev/tty
+  else printf '%s' "$2"; fi
+  [ "${1:-y}" = y ] && { [ -t 0 ] && printf '\n' > /dev/tty || printf '\n'; }
+  return 0
+}
+
+tty_read() {   # 读一行到 $1
+  # 中间变量不能叫 line: 调用方 (ask / ask_yes / pick_multi) 自己就有个叫 line 的
+  # 局部变量, 而 bash 的动态作用域让被调函数里的 local 直接盖住它 —— read 填进去的
+  # 字符串会随本函数返回一起消失, 调用方读到的永远是空。
+  # 后果很隐蔽: 界面回显正常, 但所有答案都静默退回默认值 (只有 `--yes` 侥幸看着对)。
+  local __var="$1" __line=""
+  if [ -t 0 ]; then
+    IFS= read -r __line < /dev/tty || __line=""
+  else
+    IFS= read -r __line || __line=""
+  fi
+  printf -v "$__var" '%s' "$__line"
+  return 0
+}
+
+ask() {  # ask VAR "提示" "默认值"
+  local __v="$1" prompt="$2" def="${3:-}" ans=""
+  if [ "${ASSUME_YES:-0}" = 1 ]; then printf -v "$__v" '%s' "$def"; return 0; fi
+  _prompt y "$prompt${def:+ [$def]}: "
+  tty_read ans
+  [ -z "$ans" ] && ans="$def"
+  printf -v "$__v" '%s' "$ans"
+}
+ask_yes() {  # ask_yes "提示" y|n  → 返回 0=是
+  local prompt="$1" def="${2:-n}" ans=""
+  if [ "${ASSUME_YES:-0}" = 1 ]; then [ "$def" = y ]; return; fi
+  _prompt y "$prompt [$([ "$def" = y ] && echo 'Y/n' || echo 'y/N')]: "
+  tty_read ans
+  [ -z "$ans" ] && ans="$def"
+  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# 菜单: 逗号/空格分隔的序号; 回车 = 默认集。结果写进全局 PICKED
+pick_multi() {  # $1 = 默认序号串 (如 "2"), $2 = 选项行数
+  local def="$1" ans=""
+  if [ "${ASSUME_YES:-0}" = 1 ]; then PICKED="$def"; return 0; fi
+  _prompt y "选择 (空格或逗号分隔序号, 回车=默认 $def): "
+  tty_read ans
+  [ -z "$ans" ] && ans="$def"
+  PICKED="$(printf '%s' "$ans" | tr ',' ' ')"
+}
+
+# --------------------------------------------------------------------------
+# login: Google Colab
+# --------------------------------------------------------------------------
+# colab CLI 没有 login 子命令: OAuth 是惰性的 —— `colab sessions` 发现没有有效 token
+# 时会打印授权 URL 并 input() 等授权码。所以"登录"就是带代理前台跑一次 sessions。
+cmd_login() {
+  need_colab
+  sessions_capture
+  if printf '%s\n' "$SESSIONS_OUT" | grep -qE '^\['; then
+    ok "已登录 (colab sessions 正常返回)"
+    printf '%s\n' "$SESSIONS_OUT" | sed 's/^/  /'
+    return 0
+  fi
+  say "尚未登录 Colab。接下来 colab CLI 会打印一个授权 URL:"
+  say "  1) 在浏览器打开它并授权"
+  say "  2) 把页面给出的授权码粘贴回终端"
+  [ -n "$PROXY" ] && dim "  (走代理 $PROXY)"
+  colab_to 900 sessions || die "登录未完成"
+  ok "登录流程结束"
 }
 
 # --------------------------------------------------------------------------
@@ -571,26 +893,33 @@ cmd_watch() {
 
 cmd_service() {
   local action="${1:-install}"
-  local self="$SELF_DIR/$(basename "${BASH_SOURCE[0]:-$0}")"
-  local -a args=(-s "$SESSION" -g "$GPU" --port "$PORT" --root "$ROOT" --interval "$WATCH_INTERVAL")
-  [ "$TUNNEL_MODE" = "off" ] && args+=(--no-tunnel)
-  [ -n "$TUNNEL_NAME" ] && args+=(-n "$TUNNEL_NAME")
-  [ -n "$PROXY" ] && args+=(--proxy "$PROXY")
-  [ -n "${ON_URL_CHANGE:-}" ] && args+=(--on-url-change "$ON_URL_CHANGE")
+  # 设置几乎都在 config.sh 里 (模块级 source), 单元只要拉起 watch 就够了。
+  # SELF_PATH 已解析软链, 否则单元里嵌的是软链路径, 找不到 remote/。
+  local self="$SELF_PATH"
+  local -a args=(watch)
+  if [ "$CONFIG_FILE" != "$CONFIG_DIR/config.sh" ]; then
+    warn "配置在非默认位置 ($CONFIG_FILE); 生成的单元只会读默认位置 —— 建议把配置放回 $CONFIG_DIR/"
+  fi
   case "$action" in
     install)
       case "$(uname -s)" in
         Darwin)
           local plist="$HOME/Library/LaunchAgents/com.colab-subtitle-gateway.plist" x=""
           mkdir -p "$(dirname "$plist")"
-          for a in "${args[@]}"; do x="$x    <string>${a//&/&amp;}</string>"$'\n'; done
+          # plist 是 XML: 除了 & 还要转义 < > (路径/参数里理论上可能出现)
+          local esc
+          for a in "${args[@]}"; do
+            esc="${a//&/&amp;}"; esc="${esc//</&lt;}"; esc="${esc//>/&gt;}"
+            x="$x    <string>$esc</string>"$'\n'
+          done
+          local self_esc="${self//&/&amp;}"; self_esc="${self_esc//</&lt;}"; self_esc="${self_esc//>/&gt;}"
           cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.colab-subtitle-gateway</string>
   <key>ProgramArguments</key><array>
-    <string>/bin/bash</string><string>$self</string><string>watch</string>
+    <string>/bin/bash</string><string>$self_esc</string>
 $x  </array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>$PATH</string>
@@ -617,7 +946,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$self watch $(printf '%q ' "${args[@]}")
+ExecStart=$self $(printf '%q ' "${args[@]}")
 Restart=always
 RestartSec=30
 Environment=PATH=$PATH
@@ -653,9 +982,14 @@ EOF
 cmd_demo() {
   local u; u="$(cat "$URL_FILE" 2>/dev/null)"
   [ -n "$u" ] || die "先 colab-sg up"
+  local model="${PRELOAD:-}"; [ -n "$model" ] || model="${MODELS%% *}"
+  [ -n "$model" ] || die "没选中任何模型 (colab-sg config)"
   # 测试音频不落本地: 直连 raw.githubusercontent.com 在被污染的 DNS 下会超时,
   # 而 VM 上就有仓库自带的语料。VM 取不到时再退回本地下载。
-  local wav; wav="$(mktemp "${TMPDIR:-/tmp}/csg-demo.XXXXXX.wav")"
+  # 后缀必需 (curl 靠它认 wav), 但 BSD mktemp 的模板必须**以 XXXXXX 结尾** ——
+  # macOS 上 "…XXXXXX.wav" 不会替换占位符, 直接报 "File exists"; GNU 两种都认。
+  # 所以先建临时目录再拼文件名。
+  local wav; wav="$(mktemp -d "${TMPDIR:-/tmp}/csg-demo.XXXXXX")/short.wav"
   say "取一段测试音频 (VM 上仓库自带的日语语料) ..."
   if vm_cmd "base64 -w0 '$REPO_DIR/bench/audio/ja/short.wav'" 2>/dev/null \
        | grep -oE '[A-Za-z0-9+/=]{100,}' | head -1 | tr -d '\n' | base64 -d > "$wav" 2>/dev/null && [ -s "$wav" ]; then
@@ -665,16 +999,540 @@ cmd_demo() {
       || die "拿测试音频失败 (VM 取不到, 本地下载也失败)"
   fi
   say "① 健康检查"; curl -s -m 20 "$u/health"; echo
-  say "② ASR (旗舰模型)"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
-    -F "file=@$wav" -F model=fun-asr-nano-2512; echo
-  say "③ ASR + 分段"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
-    -F "file=@$wav" -F model=fun-asr-nano-2512 -F response_format=verbose_json \
-    -F 'timestamp_granularities[]=segment'; echo
-  say "④ 翻译 (LibreTranslate 协议)"; curl -s -m 60 -X POST "$u/translate" \
-    -H 'Content-Type: application/json' -d '{"q":"Hello world","source":"en","target":"zh"}'; echo
-  say "⑤ 翻译 (DeepL 协议)"; curl -s -m 60 -X POST "$u/v1/translate" \
-    -H 'Content-Type: application/json' -d '{"text":["Good morning"],"target_lang":"ZH"}'; echo
-  rm -f "$wav"
+  if has_proto openai; then
+    say "② ASR (模型 $model)"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+      -F "file=@$wav" -F "model=$model"; echo
+    say "③ ASR + 分段"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+      -F "file=@$wav" -F "model=$model" -F response_format=verbose_json \
+      -F 'timestamp_granularities[]=segment'; echo
+  fi
+  if has_proto ferrum; then
+    say "④ ferrum 协议 (${AUTH_SECRET:+带 x-auth-token})"
+    # ferrum 收原始 body (不是 multipart), 而且只认 16kHz 单声道 16bit wav
+    # (asr.validate_wav)。VM 上的 ja/short.wav 就是按这个规格切的。
+    local -a hdr=(-H "x-model: $model" -H 'x-compression: wav')
+    if [ -n "$AUTH_SECRET" ]; then
+      local tok; tok="$(printf '%s' "$AUTH_SECRET" | sha256hex)"
+      hdr+=(-H "x-auth-token: $tok")
+    fi
+    # -H 'Expect:' : 大 body 下 curl 会先发 Expect: 100-continue, 有些前置代理处理不好
+    curl -s -m 300 -X POST "$u/transcribe" "${hdr[@]}" -H 'Expect:' \
+      --data-binary "@$wav" | head -c 400; echo
+  fi
+  if has_proto libretranslate; then
+    say "⑤ 翻译 (LibreTranslate 协议)"
+    local -a lh=(-H 'Content-Type: application/json')
+    [ -n "$LIBRETRANSLATE_API_KEY" ] && lh+=(-H "x-api-key: $LIBRETRANSLATE_API_KEY")
+    curl -s -m 60 -X POST "$u/translate" "${lh[@]}" \
+      -d "{\"q\":\"Hello world\",\"source\":\"en\",\"target\":\"zh\"${LIBRETRANSLATE_API_KEY:+,\"api_key\":\"$LIBRETRANSLATE_API_KEY\"}}"; echo
+  fi
+  if has_proto deepl; then
+    say "⑥ 翻译 (DeepL 协议)"
+    local -a dh=(-H 'Content-Type: application/json')
+    [ -n "$TRANSLATE_API_KEY" ] && dh+=(-H "Authorization: DeepL-Auth-Key $TRANSLATE_API_KEY")
+    curl -s -m 60 -X POST "$u/v1/translate" "${dh[@]}" \
+      -d '{"text":["Good morning"],"target_lang":"ZH"}'; echo
+  fi
+  rm -f "$wav"; rmdir "$(dirname "$wav")" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------
+# 写配置 / 密钥文件
+# --------------------------------------------------------------------------
+# 注意格式: 全部写成自引用的 `CSG_X="${CSG_X-value}"` —— 普通赋值会盖掉进程环境,
+# 那样优先级就成了 "配置 > 环境", 与文档相反 (macOS 的 bash 3.2 也支持这个写法)。
+write_config_sh() {
+  mkdir -p "$CONFIG_DIR"
+  ( umask 077
+    cat > "$CONFIG_FILE" <<EOF
+# colab-sg 配置 — 由 \`colab-sg config\` 生成, 也可手改。
+# 优先级: 命令行参数 > 环境变量 > 本文件 > 内置默认。
+# 密钥不在这里, 在 secrets.env (也不会进 git)。
+
+CSG_SESSION="\${CSG_SESSION-$SESSION}"
+CSG_GPU="\${CSG_GPU-$GPU}"
+CSG_PORT="\${CSG_PORT-$PORT}"
+CSG_DEVICE="\${CSG_DEVICE-$DEVICE}"
+CSG_ROOT="\${CSG_ROOT-$ROOT}"
+CSG_MODELS="\${CSG_MODELS-$MODELS}"
+CSG_PRELOAD="\${CSG_PRELOAD-$PRELOAD}"
+CSG_MAX_LOADED_MODELS="\${CSG_MAX_LOADED_MODELS-$MAX_LOADED}"
+CSG_PROTOCOLS="\${CSG_PROTOCOLS-$PROTOCOLS}"
+CSG_TRANSLATE_FREE="\${CSG_TRANSLATE_FREE-$TRANSLATE_FREE}"
+CSG_TRANSLATE_UPSTREAM="\${CSG_TRANSLATE_UPSTREAM-$TRANSLATE_UPSTREAM}"
+CSG_LIBRETRANSLATE_UPSTREAM="\${CSG_LIBRETRANSLATE_UPSTREAM-$LIBRETRANSLATE_UPSTREAM}"
+CSG_TUNNEL_MODE="\${CSG_TUNNEL_MODE-$TUNNEL_MODE}"
+CSG_TUNNEL_NAME="\${CSG_TUNNEL_NAME-$TUNNEL_NAME}"
+CSG_TUNNEL_HOSTNAME="\${CSG_TUNNEL_HOSTNAME-$TUNNEL_HOSTNAME}"
+CSG_TUNNEL_TOKEN_FILE="\${CSG_TUNNEL_TOKEN_FILE-$TUNNEL_TOKEN_FILE}"
+CSG_PROXY="\${CSG_PROXY-$PROXY}"
+CSG_WATCH_INTERVAL="\${CSG_WATCH_INTERVAL-$WATCH_INTERVAL}"
+CSG_UV_INDEX="\${CSG_UV_INDEX-${CSG_UV_INDEX:-}}"
+CSG_UPSTREAM_REV="\${CSG_UPSTREAM_REV-$UPSTREAM_REV}"
+EOF
+  )
+  chmod 600 "$CONFIG_FILE"
+  dim "  配置 → $CONFIG_FILE (600)"
+}
+
+sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }   # 单引号转义
+
+write_secrets_env() {
+  mkdir -p "$CONFIG_DIR"
+  ( umask 077
+    cat > "$SECRETS_FILE" <<EOF
+# colab-sg 密钥 — 600, 不进 git, 只经 colab exec 的 stdin 送进 VM ($VM_SECRETS)
+CSG_AUTH_SECRET='$(sq "$AUTH_SECRET")'
+CSG_ENCRYPTION_KEY='$(sq "$ENCRYPTION_KEY")'
+CSG_TRANSLATE_API_KEY='$(sq "$TRANSLATE_API_KEY")'
+CSG_TRANSLATE_UPSTREAM_KEY='$(sq "$TRANSLATE_UPSTREAM_KEY")'
+CSG_LIBRETRANSLATE_API_KEY='$(sq "$LIBRETRANSLATE_API_KEY")'
+CSG_LIBRETRANSLATE_UPSTREAM_KEY='$(sq "$LIBRETRANSLATE_UPSTREAM_KEY")'
+EOF
+  )
+  chmod 600 "$SECRETS_FILE"
+  dim "  密钥 → $SECRETS_FILE (600)"
+}
+
+gen_hex() { openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+cmd_keygen() {
+  AUTH_SECRET="$(gen_hex)"; ENCRYPTION_KEY="$(gen_hex)"
+  write_secrets_env
+  ok "已生成 ferrum 鉴权密钥与加密口令 (写入 $SECRETS_FILE)"
+  dim "  客户端 (如 mpv STT 插件) 需要带上: x-auth-token = sha256(secret) = $(printf '%s' "$AUTH_SECRET" | sha256hex)"
+  dim "  让网关生效: colab-sg reload"
+}
+
+# --------------------------------------------------------------------------
+# 选模型 / 选协议 / 选隧道 —— 向导的各步骤
+# --------------------------------------------------------------------------
+# 上游清单落地到本地, 渲染成菜单。
+# 优先 VM 上那份 (唯一真相); VM 够不着 (会话没起/网络断了) 就退回本机缓存的上一次结果,
+# 否则 --dry-run 这种离线场景连菜单都渲染不出来。
+fetch_manifest() {
+  # 用哨兵行取, 不要拿 sed 的 {} 范围切: 清单是嵌套 JSON, 内层 "models" 的收尾 }
+  # 也顶格, 范围匹配会把它当成结尾, 切出来是个半截对象。
+  local out
+  # 读**上游**清单 (models.upstream.json): repo/models.json 装好之后就是"选中的那几项"了,
+  # 拿它当菜单数据源, 上游新增的模型永远看不见, 之前没选的也再也加不回来。
+  out="$(vm_cmd "printf '__CSG_JSON_BEGIN__\n'; cat $ROOT/models.upstream.json 2>/dev/null || cat $REPO_DIR/models.json 2>/dev/null || true; printf '\n__CSG_JSON_END__\n'")"
+  out="$(printf '%s\n' "$out" | sed -n '/^__CSG_JSON_BEGIN__$/,/^__CSG_JSON_END__$/p' | sed '1d;$d')"
+  if [ -n "$out" ] && printf '%s\n' "$out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    printf '%s\n' "$out" > "$STATE_DIR/models.upstream.json"
+    return 0
+  fi
+  if [ -s "$STATE_DIR/models.upstream.json" ] \
+     && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_DIR/models.upstream.json" 2>/dev/null; then
+    dim "  用本机缓存的上游清单 ($STATE_DIR/models.upstream.json)"
+    return 0
+  fi
+  warn "VM 上没有 models.json (仓库还没克隆?)"
+  dim "  先在 VM 上克隆: colab-sg setup, 或等 install 走到克隆那一步"
+  return 1
+}
+
+# 打表 + 多选。结果写全局 MODELS / PRELOAD
+wizard_models() {
+  say ""
+  say "── 模型 (上游 subtitle-gateway 的清单) ──"
+  local ids; ids="$(python3 - "$STATE_DIR/models.upstream.json" <<'PY' 2>/dev/null
+import json,sys
+m=json.load(open(sys.argv[1]))
+for i,(k,e) in enumerate(m["models"].items(),1):
+    langs=e.get("languages",[]); note=e.get("note","")
+    tag=" [需 qwen-asr]" if "qwen" in k or "qwen" in e.get("model","").lower() else ""
+    print("%d|%s|%s|%d 语|%s%s" % (i,k,e.get("model",""),len(langs),note,tag))
+PY
+)"
+  [ -n "$ids" ] || { warn "读不到模型清单, 保持原选择: $MODELS"; return 0; }
+  printf '%s\n' "$ids" | while IFS='|' read -r n key model nlang note; do
+    printf '  %s) %-18s %-12s %-42s %s\n' "$n" "$key" "$model" "$nlang" "$note"
+  done
+  local defidx=""
+  local k
+  for k in $MODELS; do
+    defidx="$defidx$(printf '%s\n' "$ids" | awk -F'|' -v k="$k" '$2==k{print $1" "}')"
+  done
+  [ -n "$defidx" ] || defidx="$(printf '%s\n' "$ids" | head -1 | cut -d'|' -f1)"
+  pick_multi "$defidx" "$(printf '%s\n' "$ids" | wc -l | tr -d ' ')"
+  local sel="" n
+  for n in $PICKED; do
+    local key; key="$(printf '%s\n' "$ids" | awk -F'|' -v n="$n" '$1==n{print $2}')"
+    [ -n "$key" ] && sel="$sel $key"
+  done
+  sel="${sel# }"
+  [ -n "$sel" ] || { warn "一个都没选, 保持原选择: $MODELS"; return 0; }
+  MODELS="$sel"
+  # 预载: 默认选中的第一个; 也可以只预载其中一个 (启动更快)
+  local first="${MODELS%% *}"
+  if [ "$(printf '%s' "$MODELS" | wc -w | tr -d ' ')" -gt 1 ]; then
+    ask PRELOAD "  启动预载哪个 (其余按需加载)" "$first"
+  else
+    PRELOAD="$first"
+  fi
+  case " $MODELS " in *" $PRELOAD "*) ;; *) warn "  $PRELOAD 不在选中列表里, 改用 $first"; PRELOAD="$first" ;; esac
+  # 常驻上限: T4 15G, 两个已是上限
+  local cnt; cnt="$(printf '%s' "$MODELS" | wc -w | tr -d ' ')"
+  if [ "$cnt" -gt 1 ]; then
+    ask MAX_LOADED "  最多常驻几个 (0=不限)" "$(( cnt < 2 ? cnt : 2 ))"
+  else
+    MAX_LOADED="1"
+  fi
+  ok "  选中: $MODELS  预载: $PRELOAD  常驻上限: $MAX_LOADED"
+}
+
+wizard_protocols() {
+  say ""
+  say "── 协议 ──"
+  dim "  说明: 4 条路由是网关无条件挂载的, /health 与 /v1/models 也没有鉴权开关。"
+  dim "  能真正控制的只有翻译那一半 (没勾翻译协议 + 没有免费源 → 503)。"
+  local -a all=(openai ferrum deepl libretranslate)
+  local i=1 p
+  for p in "${all[@]}"; do
+    case "$p" in
+      openai)         printf '  %d) %-14s %s\n' "$i" "$p" "/v1/audio/transcriptions — 永远可用" ;;
+      ferrum)         printf '  %d) %-14s %s\n' "$i" "$p" "/transcribe — 可用 --auth-secret / --encryption-key 加鉴权" ;;
+      deepl)          printf '  %d) %-14s %s\n' "$i" "$p" "/v1/translate — 不勾则退回免费源, 免费源也没有就 503" ;;
+      libretranslate) printf '  %d) %-14s %s\n' "$i" "$p" "/translate — 同上" ;;
+    esac
+    i=$((i+1))
+  done
+  local -a cur; read -r -a cur <<<"$PROTOCOLS"; local def=""
+  i=1
+  for p in "${all[@]}"; do
+    for c in "${cur[@]}"; do [ "$c" = "$p" ] && def="$def $i"; done
+    i=$((i+1))
+  done
+  def="${def# }"
+  pick_multi "$def" 4
+  local sel="" n
+  for n in $PICKED; do
+    case "$n" in 1) sel="$sel openai" ;; 2) sel="$sel ferrum" ;; 3) sel="$sel deepl" ;; 4) sel="$sel libretranslate" ;; esac
+  done
+  PROTOCOLS="${sel# }"
+  ok "  启用: ${PROTOCOLS:-<无>} (ASR 路由仍挂载, 只是 demo 会跳过)"
+  # 翻译免费源 (只对翻译那两条路由有意义)
+  if has_proto deepl || has_proto libretranslate; then
+    ask TRANSLATE_FREE "  免费翻译源 (google,edge / alibaba,google,edge / none)" "$TRANSLATE_FREE"
+  fi
+  # ferrum 鉴权
+  if [ -z "${_PROTO_FERRUM_ASKED:-}" ]; then
+    case " $PROTOCOLS " in
+      *" ferrum "*)
+        if [ -z "$AUTH_SECRET" ]; then
+          if ask_yes "  为 ferrum 生成鉴权密钥? (客户端要带 x-auth-token, 不带会 401)" y; then
+            AUTH_SECRET="$(gen_hex)"
+          fi
+        else
+          dim "  ferrum 密钥已存在 (secrets.env)"
+          ask_yes "  保留现有密钥?" y || AUTH_SECRET="$(gen_hex)"
+        fi
+        if ask_yes "  再生成一个 AES-256-GCM 加密口令 (客户端可用 x-encrypted: 1)?" n; then
+          ENCRYPTION_KEY="$(gen_hex)"
+        fi ;;
+      *)
+        AUTH_SECRET=""; ENCRYPTION_KEY="" ;;
+    esac
+  fi
+}
+
+wizard_tunnel() {
+  say ""
+  say "── 公网入口 ──"
+  printf '  1) quick  %s\n' "Cloudflare 匿名隧道, 零配置, 但重建会话就换域名 (免费额度下会经常换)"
+  printf '  2) token  %s\n' "固定域名 (推荐): Zero Trust 建隧道 + 配主机名, 拿 connector token"
+  printf '  3) named  %s\n' "固定域名 (cert.pem): 在 Colab 里跑 cloudflared tunnel login, 会话回收后要重登"
+  printf '  4) off    %s\n' "不开隧道 (只在 VM 内网用)"
+  # 默认项要反映**已保存**的模式: 上次选了 named (有隧道名) 却因为默认是 quick 而回车,
+  # 会静默把用户从固定域名踢回 quick tunnel —— 连 TUNNEL_HOSTNAME 都还留着, 看着像是没变。
+  local def="2" choice="" tokfile=""
+  case "$TUNNEL_MODE" in
+    token) def="2" ;;
+    named) def="3" ;;
+    off)   def="4" ;;
+    *)     [ -s "$TUNNEL_TOKEN_FILE" ] && def="2" || def="1" ;;
+  esac
+  ask choice "  选择" "$def"
+  case "$choice" in
+    2|token)
+      TUNNEL_MODE="token"
+      ask TUNNEL_HOSTNAME "  公网主机名 (如 asr.example.com)" "$TUNNEL_HOSTNAME"
+      if [ ! -s "$TUNNEL_TOKEN_FILE" ]; then
+        say "  还没有 connector token。在 Cloudflare Zero Trust → Networks → Tunnels 里:"
+        say "    1) Create a tunnel (Cloudflared)  2) Public Hostnames 加一条指向 localhost:$PORT"
+        say "    3) 复制给出的 eyJhIjoi… token"
+        ask tokfile "  把 token 粘贴到这里, 或给出 token 文件路径 (回车跳过)" ""
+        case "$tokfile" in
+          eyJ*) ( umask 077; printf '%s' "$tokfile" > "$TUNNEL_TOKEN_FILE" ) ;;
+          "")   warn "  没给 token; 之后放到 $TUNNEL_TOKEN_FILE 再 colab-sg up 即可" ;;
+          *)    [ -s "$tokfile" ] && { ( umask 077; cat "$tokfile" > "$TUNNEL_TOKEN_FILE" ); } || warn "  文件不存在: $tokfile" ;;
+        esac
+      else
+        dim "  已有 token: $TUNNEL_TOKEN_FILE"
+      fi
+      ;;
+    3|named)
+      TUNNEL_MODE="named"
+      ask TUNNEL_NAME "  隧道名" "${TUNNEL_NAME:-colab-sg}"
+      ask TUNNEL_HOSTNAME "  公网主机名 (如 asr.example.com)" "$TUNNEL_HOSTNAME"
+      dim "  这一步要等 Colab 会话起来之后才能落 cert.pem: colab-sg tunnel login"
+      ;;
+    4|off) TUNNEL_MODE="off" ;;
+    *)     TUNNEL_MODE="quick" ;;
+  esac
+  ok "  隧道模式: $TUNNEL_MODE${TUNNEL_HOSTNAME:+ → https://$TUNNEL_HOSTNAME}"
+}
+
+# --------------------------------------------------------------------------
+# config: 只改配置 (不重装依赖 / 不重下模型)
+# --------------------------------------------------------------------------
+cmd_config() {
+  need_colab
+  wizard_session
+  session_ensure
+  sync_vm
+  fetch_manifest || true
+  wizard_models
+  wizard_protocols
+  wizard_tunnel
+  write_config_sh
+  write_secrets_env
+  if [ "$DRY_RUN" = 1 ]; then
+    ok "dry-run: 配置已写到本地, 未推送到 VM"
+    dim "  将要推送: $VM_DEPLOY_ENV / $VM_SELECTED / $VM_SECRETS${TUNNEL_TOKEN_FILE:+ / $VM_TUNNEL_TOKEN}"
+    return 0
+  fi
+  write_driver
+  refresh_env
+  vm_run_file "$VM_DRIVER" | tail -1
+  push_selected_manifest
+  push_secrets
+  push_tunnel_token
+  ok "配置已推送到 VM"
+  dim "  模型/协议变了要重启网关才生效: colab-sg reload (不掉会话)"
+  dim "  新模型要先下载: colab-sg setup"
+}
+
+wizard_session() {
+  say ""
+  say "── 会话 ──"
+  ask SESSION "  Colab 会话名" "$SESSION"
+  ask GPU     "  GPU 型号 (T4/L4/A100/H100)" "$GPU"
+  ask PORT    "  网关端口" "$PORT"
+  ask DEVICE  "  设备 (cuda/auto/cpu)" "$DEVICE"
+  ask PROXY   "  访问 Google 的代理 (可空)" "$PROXY"
+}
+
+# --------------------------------------------------------------------------
+# tunnel: 登录 / 状态
+# --------------------------------------------------------------------------
+cmd_tunnel() {
+  local action="${1:-status}"
+  if [ "$action" = "status" ]; then
+    printf '  模式              %s\n' "${TUNNEL_MODE:-<未设>}"
+    printf '  token 文件        %s\n' "$([ -s "$TUNNEL_TOKEN_FILE" ] && echo "$TUNNEL_TOKEN_FILE" || echo '(无)')"
+    printf '  固定主机名        %s\n' "${TUNNEL_HOSTNAME:-<未设>}"
+    printf '  隧道名            %s\n' "${TUNNEL_NAME:-<未设>}"
+    [ -s "$URL_FILE" ] && printf '  当前公网地址      %s\n' "$(cat "$URL_FILE")"
+    return 0
+  fi
+  [ "$action" = login ] || die "用法: colab-sg tunnel login|status"
+  need_colab
+  if [ -n "$TUNNEL_HOSTNAME" ] && [ -s "$TUNNEL_TOKEN_FILE" ]; then
+    ok "token 模式已就绪 (固定域名 https://$TUNNEL_HOSTNAME), 不需要登录 cloudflared"
+    dim "  换域名: 改 CSG_TUNNEL_HOSTNAME (colab-sg config)"
+    return 0
+  fi
+  [ -n "$TUNNEL_NAME" ] || die "先 colab-sg config 设隧道名 (cert.pem 模式), 或用 token 模式"
+  session_ensure; sync_vm
+  say "在 Colab VM 上跑 cloudflared tunnel login —— 它会打印一个 URL,"
+  say "在浏览器里授权, cert.pem 会自动落到 VM (~/.cloudflared/cert.pem)。"
+  # 后台跑: login 会一直等浏览器授权, 把它和 create/route 串起来丢后台, 我们轮询日志
+  { echo '#!/bin/bash'
+    echo 'export PATH="/content:$PATH"'
+    echo '/content/cloudflared tunnel --no-autoupdate login'
+    echo 'for i in $(seq 1 300); do [ -s ~/.cloudflared/cert.pem ] && break; sleep 2; done'
+    echo '[ -s ~/.cloudflared/cert.pem ] || { echo "NO_CERT"; exit 1; }'
+    echo "echo CERT_READY"
+    echo "/content/cloudflared tunnel create '$TUNNEL_NAME' || true"
+    echo "/content/cloudflared tunnel route dns '$TUNNEL_NAME' '$TUNNEL_HOSTNAME' || true"
+    echo "echo TUNNEL_READY"
+  } > "$STATE_DIR/tunnel-login.sh"
+  vm_launch "$STATE_DIR/tunnel-login.sh" tunnel-login | tail -1
+  say "等你在浏览器里授权 (最多 10 分钟) ..."
+  vm_wait tunnel-login 600 'https://dash.cloudflare.com|CERT_READY|TUNNEL_READY|NO_CERT' || warn "还没完成; 看: colab-sg exec tail -n 40 $RUN_DIR/tunnel-login.log"
+  vm_cmd "grep -oE 'https://dash\\.cloudflare\\.com[^ ]*' $RUN_DIR/tunnel-login.log | head -1" | tr -d '\r' | sed 's/^/  授权链接: /'
+  TUNNEL_MODE="named"; write_config_sh
+  ok "隧道准备完成; 域名: https://$TUNNEL_HOSTNAME"
+  warn "cert.pem 只活在 VM 上 —— Colab 会话被回收后就没了, 得重新 login。"
+  warn "想跨会话固定域名, 用 token 模式 (改 CSG_TUNNEL_MODE=token)。"
+}
+
+# --------------------------------------------------------------------------
+# models: 选中的模型 vs VM 上实际缓存
+# --------------------------------------------------------------------------
+cmd_models() {
+  printf '  选中 (本地)   %s\n' "${MODELS:-<无>}"
+  printf '  预载          %s\n' "${PRELOAD:-<网关默认>}"
+  printf '  常驻上限      %s\n' "${MAX_LOADED:-<网关默认 1>}"
+  printf '  上游 rev      %s\n' "${UPSTREAM_REV:-<未知>}"
+  need_colab
+  say "  ── VM 上实际 ──"
+  vm_cmd "bash $SRC_DIR/remote/setup.sh --check" 2>/dev/null \
+    | grep -E 'upstream:|selected:|drift:|^  [a-z0-9]|models_cache:|READY:' | sed 's/^/  /'
+}
+
+# --------------------------------------------------------------------------
+# upgrade
+# --------------------------------------------------------------------------
+cmd_upgrade() {
+  need_colab
+  say "升级 colab-sg 本地脚本与 VM 侧环境 ..."
+  local repo_dir; repo_dir="$(cd "$SELF_DIR/.." && pwd)"
+  if [ -d "$repo_dir/.git" ]; then
+    git -C "$repo_dir" pull --ff-only 2>&1 | tail -3 | sed 's/^/  /' || warn "git pull 失败 (本地有改动?), 继续用当前代码"
+  fi
+  local old_rev="$UPSTREAM_REV"
+  session_ensure; sync_vm
+  write_driver; refresh_env; vm_run_file "$VM_DRIVER" | tail -1
+  push_selected_manifest; push_secrets; push_tunnel_token
+  assess_vm
+  [ -n "$old_rev" ] && [ "$old_rev" != "$UPSTREAM_REV" ] \
+    && warn "上游 subtitle-gateway: $old_rev → $UPSTREAM_REV" \
+    && dim "  清单/接口可能变了; 建议 colab-sg config 复核一次模型与协议"
+  [ "$NEED_DEPS" = 1 ] && FORCE=1 && cmd_setup
+  write_config_sh
+  cmd_reload
+}
+
+# --------------------------------------------------------------------------
+# uninstall
+# --------------------------------------------------------------------------
+cmd_uninstall() {
+  say "卸载 colab-sg ..."
+  need_colab
+  cmd_down
+  cmd_service uninstall 2>/dev/null || true
+  rm -f "$STATE_DIR/setup-job.sh" "$STATE_DIR/up-job.sh" "$STATE_DIR/driver.sh" \
+        "$STATE_DIR/env.sh" "$STATE_DIR/tunnel-login.sh" "$STATE_DIR/.synced" \
+        "$STATE_DIR/.secrets.push" "$STATE_DIR/models.upstream.json" 2>/dev/null || true
+  if [ "$PURGE" = 1 ]; then
+    # 不碰命令本身 (bin/colab-sg): 从这个脚本里删掉自己所在的目录树是自伤行为,
+    # 而且 `uninstall --purge` 之后再想装回来还得重新 clone。真要摘命令:
+    # `./install.sh uninstall` (它只 rm 掉软链, 不碰仓库)。
+    rm -rf "$STATE_DIR" "$CONFIG_DIR"
+    ok "已清掉 $STATE_DIR 与 $CONFIG_DIR"
+    warn "VM 上的 $ROOT 还在 (会话释放后随 VM 消失; 想现在就删: colab-sg exec rm -rf $ROOT)"
+  else
+    dim "保留配置与状态目录 (想一起清: colab-sg uninstall --purge)"
+  fi
+}
+# --------------------------------------------------------------------------
+# install: 交互式向导 (幂等, 可重跑)
+# --------------------------------------------------------------------------
+cmd_install() {
+  say "colab-sg 交互式安装向导"
+  say "(所有选择都会写进 $CONFIG_FILE, 之后用 colab-sg config 随时改)"
+  [ "$DRY_RUN" = 1 ] && warn "dry-run: 只打印将要执行的动作, 不碰 VM"
+
+  # ① 本地自检
+  need_colab
+  command -v timeout >/dev/null 2>&1 || dim "  提示: 没有 timeout, exec 少了兜底超时 (可选)"
+
+  # ② 登录 Colab
+  say ""
+  say "── ① Colab 登录 ──"
+  cmd_login
+
+  # ③ 会话 + 基本参数 (菜单要读 VM 上的清单, 所以会话必须先起来)
+  wizard_session
+  if [ "$DRY_RUN" = 1 ]; then
+    say ""
+    say "── 将要执行的远端动作 (会话 $SESSION @$GPU, 根 $ROOT) ──"
+    printf '  %s\n' "colab sessions                                  # 探活/登录"
+    printf '  %s\n' "colab new --gpu $GPU -s $SESSION"
+    printf '  %s\n' "colab exec -f driver.sh                         # 注入 remote/*.sh + $ROOT/deploy.env"
+    printf '  %s\n' "colab exec -f secrets.sh                        # → $ROOT/secrets.env (600)"
+    printf '  %s\n' "colab exec -f clone.sh                          # bash \$SRC/remote/setup.sh --clone"
+    printf '  %s\n' "colab exec -f selected.sh                       # $ROOT/models.selected.json ← 选中的模型"
+    printf '  %s\n' "colab exec -f tunnel.sh                         # $ROOT/tunnel.token (仅 token 模式)"
+    printf '  %s\n' "bash \$SRC/remote/setup.sh --deps                # venv + 服务端依赖 + (选了 Qwen 才装) qwen-asr"
+    printf '  %s\n' "bash \$SRC/remote/setup.sh --models              # 只下选中的模型"
+    printf '  %s\n' "bash \$SRC/remote/supervisor.sh start           # 起网关 + 隧道 + 保活循环"
+    printf '  %s\n' "curl \$URL/health && curl \$URL/v1/translate     # demo 自测"
+    printf '  %s\n' "colab-sg service install                        # 本机 launchd/systemd 常驻"
+    say ""
+    say "── 当前生效的配置 (模型/协议那几步在 dry-run 里不重问) ──"
+    printf '  %s\n' "模型        ${MODELS:-<未选>}"
+    printf '  %s\n' "预载/上限   ${PRELOAD:-<默认>} / ${MAX_LOADED:-<默认>}"
+    printf '  %s\n' "协议        ${PROTOCOLS:-<无>}  (免费翻译源: ${TRANSLATE_FREE:-<无>})"
+    printf '  %s\n' "ferrum      $([ -n "$AUTH_SECRET" ] && echo '带 --auth-secret (客户端需 x-auth-token)' || echo '无鉴权')"
+    printf '  %s\n' "隧道        ${TUNNEL_MODE:-<推断>}${TUNNEL_HOSTNAME:+ → https://$TUNNEL_HOSTNAME}"
+    printf '  %s\n' "设备        $DEVICE, 端口 $PORT"
+    ok "dry-run 结束: 没碰 VM、没下载、没改本地配置"
+    return 0
+  fi
+  session_ensure
+  sync_vm
+  push_secrets
+
+  # ④ 克隆上游 → 读清单 → 选模型
+  say ""
+  say "── ② 克隆上游 & 选模型 ──"
+  { echo '#!/bin/bash'; echo "[ -f '$VM_DEPLOY_ENV' ] && . '$VM_DEPLOY_ENV'"; echo "bash $SRC_DIR/remote/setup.sh --clone"; } > "$STATE_DIR/clone-job.sh"
+  vm_launch "$STATE_DIR/clone-job.sh" clone | tail -1
+  vm_wait clone 900 'rev:|clone done' || warn "克隆可能没完成; 继续 (模型菜单会用已有清单)"
+  fetch_manifest || true
+  wizard_models
+  write_config_sh
+  refresh_env
+  write_driver; vm_run_file "$VM_DRIVER" | tail -1
+  push_selected_manifest
+
+  # ⑤ 协议 + 密钥 + 隧道
+  say ""
+  say "── ③ 协议与密钥 ──"
+  wizard_protocols
+  write_config_sh
+  write_secrets_env
+  write_driver; vm_run_file "$VM_DRIVER" | tail -1
+  push_secrets
+
+  say ""
+  say "── ④ 公网入口 ──"
+  wizard_tunnel
+  write_config_sh
+  push_tunnel_token
+
+  # ⑥ 依赖 + 模型 (用的是刚推上去的 deploy.env + models.selected.json)
+  say ""
+  say "── ⑤ 装依赖 & 下模型 ──"
+  sync_vm
+  cmd_setup
+
+  # ⑦ 起服务
+  say ""
+  say "── ⑥ 起网关 + 隧道 ──"
+  cmd_up
+  U="$(cat "$URL_FILE" 2>/dev/null || true)"
+  [ -n "$U" ] && ok "公网地址: $U"
+
+  # ⑧ 自测 + 常驻服务
+  say ""
+  if ask_yes "── 跑一遍端到端自测 (demo)?" y; then cmd_demo; fi
+  if ask_yes "── 把保活装成常驻服务 (launchd/systemd)?" y; then
+    cmd_service install
+  else
+    dim "  之后想常驻: colab-sg service install"
+  fi
+
+  say ""
+  ok "安装完成。常用命令:"
+  dim "  colab-sg status      一屏看会话/网关/隧道/地址"
+  dim "  colab-sg config      改模型/协议/密钥/域名"
+  dim "  colab-sg upgrade     升级脚本与 VM 侧环境"
+  dim "  colab-sg uninstall   卸载 (--purge 连配置一起清)"
 }
 
 # --------------------------------------------------------------------------
@@ -687,7 +1545,20 @@ cmd_doctor() {
   printf '  timeout           %s\n' "$(command -v timeout || echo '缺失(可选, 只是少了 exec 兜底超时)')"
   printf '  会话              %s\n' "$(sessions_capture; printf '%s' "$SESSIONS_OUT" | tr '\n' ' ' || echo 查询失败)"
   printf '  remote/ 源        %s\n' "$([ -d "$SRC_REMOTE" ] && echo "$SRC_REMOTE" || echo 缺失)"
+  printf '  配置文件          %s\n' "$([ -f "$CONFIG_FILE" ] && echo "$CONFIG_FILE" || echo '(未生成 → 跑 colab-sg install)')"
+  printf '  密钥文件          %s %s\n' "$([ -f "$SECRETS_FILE" ] && stat -f '%Sp' "$SECRETS_FILE" 2>/dev/null || stat -c '%A' "$SECRETS_FILE" 2>/dev/null || echo '(无)')" \
+    "$([ -f "$SECRETS_FILE" ] && echo "$SECRETS_FILE" || true)"
+  printf '  模型 (选中)       %s\n' "${MODELS:-<无>}"
+  printf '  预载 / 常驻上限   %s / %s\n' "${PRELOAD:-<网关默认>}" "${MAX_LOADED:-<网关默认 1>}"
+  printf '  协议              %s\n' "${PROTOCOLS:-<无>}"
+  printf '  ferrum 鉴权       %s\n' "$([ -n "$AUTH_SECRET" ] && echo '已启用 (客户端需带 x-auth-token)' || echo '未启用')"
+  printf '  翻译免费源        %s\n' "$TRANSLATE_FREE"
+  printf '  设备              %s, 端口 %s\n' "$DEVICE" "$PORT"
+  printf '  VM 根目录         %s\n' "$ROOT"
   printf '  Cloudflare token  %s\n' "$([ -s "$CF_TOKEN_FILE" ] && echo "$CF_TOKEN_FILE" || echo '未配置 (quick tunnel 不需要)')"
+  printf '  隧道模式          %s%s\n' "${TUNNEL_MODE:-<推断>}" \
+    "$([ -n "$TUNNEL_HOSTNAME" ] && echo " → https://$TUNNEL_HOSTNAME" || true)"
+  printf '  上游 rev          %s\n' "${UPSTREAM_REV:-<未知>}"
   printf '  状态目录          %s\n' "$STATE_DIR"
   printf '  上次公网地址      %s\n' "$([ -s "$URL_FILE" ] && cat "$URL_FILE" || echo '(无)')"
   command -v colab >/dev/null 2>&1 && colab_to 90 usage 2>/dev/null | sed 's/^/  /'
@@ -696,14 +1567,49 @@ cmd_doctor() {
 # --------------------------------------------------------------------------
 # 分发
 # --------------------------------------------------------------------------
-if [ -n "$TUNNEL_NAME" ]; then TUNNEL_MODE="named"; fi
+# 隧道模式: 显式设置优先 (--tunnel / --no-tunnel / --tunnel-mode / config.sh);
+# 没设时按"有 token 就是 token 模式, 有名字就是 cert.pem 模式"推断。
+if [ -z "$TUNNEL_MODE" ]; then
+  if [ -s "$TUNNEL_TOKEN_FILE" ]; then
+    TUNNEL_MODE="token"
+    [ -n "$TUNNEL_HOSTNAME" ] || warn "已配隧道 token, 但没设 CSG_TUNNEL_HOSTNAME —— 本地拿不到固定地址"
+  elif [ -n "$TUNNEL_NAME" ]; then
+    TUNNEL_MODE="named"
+  else
+    TUNNEL_MODE="quick"
+  fi
+elif [ "$TUNNEL_MODE" = "token" ] && [ ! -s "$TUNNEL_TOKEN_FILE" ]; then
+  warn "CSG_TUNNEL_MODE=token 但没有 token 文件 ($TUNNEL_TOKEN_FILE); 会退回 quick"
+  TUNNEL_MODE="quick"
+fi
+# 没显式给 preload 时用选中列表的第一个
+[ -n "$PRELOAD" ] || PRELOAD="${MODELS%% *}"
+[ -n "$MAX_LOADED" ] || { _cnt=$(printf '%s' "$MODELS" | wc -w | tr -d ' '); MAX_LOADED=$(( _cnt < 1 ? 1 : (_cnt < 2 ? _cnt : 2) )); }
 if [ -s "$CF_TOKEN_FILE" ]; then CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < "$CF_TOKEN_FILE")"; export CLOUDFLARE_API_TOKEN; fi
+
+# 只有 install / config 会写回配置文件。这两个命令在真跑之前先把**关键机密**落盘:
+# 向导里要生成 ferrum 密钥, 生成到一半被 Ctrl-C 掉, 下一轮 `config` 若从空 secrets.env
+# 读起, 会再生成一个 —— 而客户端手里还是上一个, 表现就是莫名其妙的 401。
+# 先把现有密钥写一遍, 之后的每一次改写都只是在同一个文件上覆盖, 不会丢。
+case "$CMD" in
+  install|config) mkdir -p "$CONFIG_DIR"; [ -f "$SECRETS_FILE" ] || write_secrets_env ;;
+esac
+
 refresh_env
 
 case "$CMD" in
+  install)          cmd_install ;;
+  config)           cmd_config ;;
+  upgrade)          cmd_upgrade ;;
+  uninstall)        cmd_uninstall ;;
+  login)            cmd_login ;;
+  tunnel:*)         cmd_tunnel "${CMD#tunnel:}" ;;
+  keygen)           cmd_keygen ;;
+  models)           cmd_models ;;
   setup)            cmd_setup ;;
   up)               cmd_up ;;
   down)             cmd_down ;;
+  reload)           cmd_reload ;;
   restart)          cmd_restart ;;
   status)           cmd_status ;;
   url)              cmd_url "${ARGS[0]:-}" ;;
