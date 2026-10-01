@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+# colab-sg — 把 subtitle-gateway 跑在 Colab GPU 上, 并对公网提供稳定入口
+#
+# 设计约束:
+#   1) VM 侧进程不依赖 Colab kernel 会话: supervisor.sh 用 setsid 把 gateway / 隧道 / 自检
+#      循环挂成独立会话; 只有会话被回收或重启才会丢。
+#   2) 会话级自愈交给 `colab-sg watch` 或 `colab-sg service install`: 会话断了自动重建,
+#      服务挂了自动拉起, 公网地址变了写文件 + 发通知。
+#   3) 不写死账号信息: cloudflared quick tunnel 零配置可用; 要固定域名就提供
+#      --tunnel-name + Cloudflare API Token。
+#   4) 长任务(装依赖/下模型/加载模型)一律丢到 VM 后台跑 + 轮询日志, 不靠一条 exec 挂到底,
+#      kernel 卡住或 exec 超时都不会把部署留在半路。
+set -uo pipefail
+
+CSG_VERSION="0.2.0"
+
+# --------------------------------------------------------------------------
+# 默认配置 (环境变量可覆盖)
+# --------------------------------------------------------------------------
+SESSION="${CSG_SESSION:-colab-sg}"
+GPU="${CSG_GPU:-T4}"
+PORT="${CSG_PORT:-8000}"
+ROOT="${CSG_ROOT:-/content/csg}"
+EXEC_TIMEOUT="${CSG_EXEC_TIMEOUT:-180}"          # 单次 colab exec 的墙钟上限
+WATCH_INTERVAL="${CSG_WATCH_INTERVAL:-120}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/colab-subtitle-gateway"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/colab-subtitle-gateway"
+URL_FILE="$STATE_DIR/url"
+EVENTS="$STATE_DIR/events.log"
+ON_URL_CHANGE="${CSG_ON_URL_CHANGE:-}"
+CF_TOKEN_FILE="${CSG_CF_TOKEN_FILE:-$CONFIG_DIR/cloudflare.token}"
+VM_DRIVER="$STATE_DIR/driver.sh"
+UPSTREAM_REPO="${CSG_UPSTREAM:-https://github.com/canxin121/subtitle-gateway.git}"
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SRC_REMOTE="$SELF_DIR/../remote"
+
+TUNNEL_NAME="${CSG_TUNNEL_NAME:-}"
+TUNNEL_MODE="quick"                              # quick | off (给了 -n 就是命名隧道)
+STOP_SESSION=0; FORCE=0; NO_INSTALL=0; DEMO=0
+
+# 远端路径 (随 --root 变)
+set_paths() {
+  REPO_DIR="$ROOT/repo"; SRC_DIR="$ROOT/src"; RUN_DIR="$ROOT/run"
+  VM_ENV="$STATE_DIR/env.sh"
+}
+set_paths
+mkdir -p "$STATE_DIR"
+
+C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+[ -t 1 ] || { C_OK=; C_WARN=; C_ERR=; C_DIM=; C_OFF=; }
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s%s%s\n' "$C_OK" "$*" "$C_OFF"; }
+warn() { printf '%s%s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
+die()  { printf '%s%s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 1; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+event(){ printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$EVENTS"; }
+
+# GNU timeout 不是每个 macOS 都有
+if command -v timeout >/dev/null 2>&1; then
+  RUN_TO() { timeout --foreground "$1" "${@:2}"; }
+else
+  RUN_TO() { shift; "$@"; }
+fi
+
+usage() { cat <<EOF
+colab-sg $CSG_VERSION — Colab GPU 上的 subtitle-gateway 服务端 + 公网入口
+
+用法: colab-sg <命令> [选项]
+
+命令:
+  setup             在 VM 上准备/更新环境 (依赖 + 下载旗舰模型), 幂等
+  up                建/复用 GPU 会话 → 同步 → 起网关 + 公网隧道
+  down              停服务; --stop-session 连 Colab 会话一起释放
+  restart           停服务 → 重建会话 → 再拉起来 (断开后的自愈入口)
+  status            会话 / 网关 / 隧道 / 公网地址 一屏
+  url [--refresh]   打印公网地址 (脚本友好)
+  logs [n]          看 VM 上的 supervisor / gateway / tunnel 日志
+  exec <命令...>    在 VM 上执行任意命令
+  watch             常驻保活: 会话断了自动重建, 地址变了写文件 + 通知
+  service install   把 watch 装成常驻服务 (macOS launchd / Linux systemd --user)
+  service uninstall 卸载常驻服务
+  doctor            本地环境体检
+  demo              部署完再跑一遍端到端自测 (ASR + 翻译)
+  version
+
+选项:
+  -s, --session NAME    会话名          (默认 \$CSG_SESSION 或 colab-sg)
+  -g, --gpu VARIANT     GPU 型号        (默认 \$CSG_GPU 或 T4; L4/A100/H100/G4 亦可)
+      --port N          网关端口        (默认 8000)
+      --root PATH       VM 上的根目录   (默认 /content/csg)
+      --tunnel          开公网隧道       (默认)
+      --no-tunnel       不开隧道
+  -n, --tunnel-name N   命名隧道名, 域名固定 (需 Cloudflare API Token)
+      --cf-token-file F Cloudflare API Token 文件 (默认 \$CONFIG_DIR/cloudflare.token)
+      --timeout N       单次 colab exec 超时秒数 (默认 180)
+      --interval N      watch: 保活间隔秒数 (默认 120)
+      --on-url-change C watch: 地址变化时执行 C (新地址在 \$CSG_URL)
+  -f, --force           setup: 强制重装依赖; up: 强制重建会话
+      --no-install      up: 环境不全时不要自动补装, 直接失败
+      --stop-session    down: 连 Colab 会话一起释放
+  -h, --help
+EOF
+}
+
+# --------------------------------------------------------------------------
+# 参数
+# --------------------------------------------------------------------------
+CMD=""; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--session)      SESSION="$2"; shift 2 ;;
+    -g|--gpu)          GPU="$2"; shift 2 ;;
+    --port)            PORT="$2"; shift 2 ;;
+    --root)            ROOT="$2"; set_paths; shift 2 ;;
+    --tunnel)          TUNNEL_MODE="quick"; shift ;;
+    --no-tunnel)       TUNNEL_MODE="off"; shift ;;
+    -n|--tunnel-name)  TUNNEL_NAME="$2"; shift 2 ;;
+    --cf-token-file)   CF_TOKEN_FILE="$2"; shift 2 ;;
+    --timeout)         EXEC_TIMEOUT="$2"; shift 2 ;;
+    --interval)        WATCH_INTERVAL="$2"; shift 2 ;;
+    --on-url-change)   ON_URL_CHANGE="$2"; shift 2 ;;
+    -f|--force)        FORCE=1; shift ;;
+    --no-install)      NO_INSTALL=1; shift ;;
+    --stop-session)    STOP_SESSION=1; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -*)                die "未知选项: $1 (--help)" ;;
+    *)                 if [ -z "$CMD" ]; then CMD="$1"; else ARGS+=("$1"); fi; shift ;;
+  esac
+done
+case "$CMD" in
+  service) CMD="service:${ARGS[0]:-install}" ;;
+  demo)    CMD="demo" ;;
+esac
+
+# --------------------------------------------------------------------------
+# VM 侧执行原语
+# --------------------------------------------------------------------------
+need_colab() { command -v colab >/dev/null 2>&1 || die "找不到 colab CLI。装: uv tool install google-colab-cli"; }
+
+# 一段 bash 从 stdin 送进 VM 跑
+vm_run() { RUN_TO "$EXEC_TIMEOUT" colab exec -s "$SESSION" "$@" 2>&1; }
+vm_cmd() { printf '%s\n' "$*" | vm_run /dev/stdin; }
+
+# 把本地文件 base64 注入 VM (路径可含空格/引号, 内容二进制安全)
+vm_put() {  # $1 本地文件  $2 远端路径
+  {
+    echo "mkdir -p '$(dirname "$2")'"
+    echo "base64 -d > '$2' <<'__CSG_B64__'"
+    base64 < "$1" | tr -d '\n'; echo
+    echo '__CSG_B64__'
+    echo "chmod 600 '$2'"
+  } | vm_run /dev/stdin
+}
+
+# 长任务: 送脚本进 VM → 脱离 kernel 后台跑 → 返回 (不等它结束)
+vm_launch() {  # $1 本地脚本  $2 任务名
+  local name="$2" rscript="$SRC_DIR/$name.sh" rlog="$RUN_DIR/$name.log" rdone="$RUN_DIR/$name.done"
+  {
+    echo "mkdir -p '$RUN_DIR' '$SRC_DIR'"
+    echo "base64 -d > '$rscript' <<'__CSG_B64__'"
+    base64 < "$1" | tr -d '\n'; echo
+    echo '__CSG_B64__'
+    echo "chmod +x '$rscript'; rm -f '$rdone'"
+    echo "setsid nohup bash -c 'bash \"$rscript\"; echo \$? > \"$rdone\"' > '$rlog' 2>&1 < /dev/null &"
+    echo "sleep 2; pgrep -f '$name.sh' >/dev/null && echo LAUNCHED || echo 'LAUNCH_FAILED (看 $rlog)'"
+  } | vm_run /dev/stdin
+}
+
+# 轮询长任务: 心跳日志打屏; 结束返回任务退出码
+vm_wait() {  # $1 任务名  $2 超时秒  $3 进度匹配(可选)
+  local name="$1" tmo="${2:-3600}" pat="${3:-}" elapsed=0 line=""
+  while [ "$elapsed" -lt "$tmo" ]; do
+    line="$(vm_cmd "if [ -f '$RUN_DIR/$name.done' ]; then echo \"DONE \$(cat '$RUN_DIR/$name.done')\"; else echo RUNNING; fi; tail -n 2 '$RUN_DIR/$name.log' 2>/dev/null | tr -d '\r'")"
+    case "$line" in
+      DONE\ 0*) ok "  $name 完成"; return 0 ;;
+      DONE*)    warn "  $name 结束但退出码异常: ${line%%$'\n'*}"; return 1 ;;
+    esac
+    if [ -n "$pat" ]; then
+      local last; last="$(printf '%s\n' "$line" | grep -E "$pat" | tail -1)"
+      [ -n "$last" ] && dim "  … $last"
+    fi
+    sleep 20; elapsed=$((elapsed+20))
+  done
+  warn "  $name 超时 (${tmo}s); 日志: colab-sg exec tail -n 20 $RUN_DIR/$name.log"
+  return 1
+}
+
+# --------------------------------------------------------------------------
+# 会话
+# --------------------------------------------------------------------------
+sessions_raw() { RUN_TO 90 colab sessions 2>/dev/null; }
+session_exists() { sessions_raw | grep -qE "^\[$SESSION\]"; }
+session_accel() { sessions_raw | grep -E "^\[$SESSION\]" | sed -n 's/.*Hardware: \([^ ]*\).*/\1/p'; }
+
+# 会话在, 但 kernel 可能正忙着别的 (colab exec 会排队)。忙就等一会儿再动手。
+session_ensure() {
+  if session_exists; then
+    local accel; accel="$(session_accel)"
+    if [ -n "$accel" ] && [ "$accel" != "$GPU" ]; then
+      warn "会话 $SESSION 是 $accel, 需要 $GPU → 重建"
+      vm_cmd "bash $SRC_DIR/remote/supervisor.sh stop" >/dev/null 2>&1 || true
+      RUN_TO 180 colab stop -s "$SESSION" >/dev/null 2>&1 || true
+      FORCE=1
+    elif [ "$FORCE" = 0 ]; then
+      ok "会话 $SESSION 已在 ($accel)"
+      return 0
+    fi
+  fi
+  say "创建 Colab 会话 $SESSION ($GPU) ..."
+  RUN_TO 900 colab new --gpu "$GPU" -s "$SESSION" || die "创建会话失败"
+  event "session created $SESSION $GPU"
+}
+
+# 本地 → VM 的用户级同步 (driver + env 文件)
+sync_vm() {
+  write_driver; vm_run "$VM_DRIVER" | tail -1
+  refresh_env
+}
+
+# driver: 把 remote/* 注入 VM, 并导出本次部署的参数
+write_driver() {
+  local f
+  for f in models.json setup.sh supervisor.sh; do
+    [ -s "$SRC_REMOTE/$f" ] || die "缺少 $SRC_REMOTE/$f —— 本脚本依赖同仓库的 remote/ 目录"
+  done
+  {
+    echo '#!/bin/bash'
+    echo '# colab-sg 远端驱动 (本地生成)'
+    echo "CSG_ROOT='$ROOT'; SRC='$SRC_DIR'"
+    echo 'mkdir -p "$SRC/remote" "$CSG_ROOT/run"'
+    for f in models.json setup.sh supervisor.sh; do
+      echo "base64 -d > '$SRC_DIR/remote/$f' <<'__CSG_B64__'"
+      base64 < "$SRC_REMOTE/$f" | tr -d '\n'; echo
+      echo '__CSG_B64__'
+      echo "chmod +x '$SRC_DIR/remote/$f'"
+    done
+    echo "export CSG_ROOT='$ROOT'"
+    echo "export CSG_PORT='$PORT'"
+    echo "export CSG_TUNNEL_MODE='$TUNNEL_MODE'"
+    echo "export CSG_TUNNEL_NAME='$TUNNEL_NAME'"
+    echo "export CSG_UV_INDEX='${CSG_UV_INDEX:-}'"
+    echo "export MODELSCOPE_CACHE='$REPO_DIR/models_cache'"
+    echo "export HF_HOME='$REPO_DIR/models_cache'"
+    # 单模型清单是"跑哪个模型"的唯一声明, 覆盖掉仓库里那份 (网关与下载脚本都读它)
+    echo "[ -d '$REPO_DIR' ] && cp '$SRC_DIR/remote/models.json' '$REPO_DIR/models.json'"
+    echo 'echo "[vm] driver ready"'
+  } > "$VM_DRIVER"
+}
+
+refresh_env() {
+  local url=""; [ -s "$URL_FILE" ] && url="$(cat "$URL_FILE")"
+  cat > "$VM_ENV" <<EOF
+# source 这个文件后可以直接操作远端网关
+VM_SESSION='$SESSION'; VM_ROOT='$ROOT'; VM_REPO='$REPO_DIR'; PUBLIC_URL='$url'
+csg_status() { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" status; }
+csg_logs()   { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" logs "\${1:-20}"; }
+csg_url()    { colab exec -s "\$VM_SESSION" bash "\$VM_ROOT/src/remote/supervisor.sh" url; }
+csg_health() { curl -s "\$PUBLIC_URL/health"; }
+EOF
+  # 远端路径与本次部署无关的部分 (--root 等) 一旦变化就重新注入驱动
+  if [ ! -f "$STATE_DIR/.synced" ] || ! grep -qF "root=$ROOT" "$STATE_DIR/.synced" 2>/dev/null; then
+    write_driver
+  fi
+  printf 'session=%s root=%s port=%s gpu=%s tunnel=%s name=%s\n' \
+    "$SESSION" "$ROOT" "$PORT" "$GPU" "$TUNNEL_MODE" "$TUNNEL_NAME" > "$STATE_DIR/.synced"
+}
+
+# --------------------------------------------------------------------------
+# setup
+# --------------------------------------------------------------------------
+# 远端体检 → 设置 NEED_DEPS / NEED_MODELS, 结果打屏
+assess_vm() {
+  say "远端体检 ..."
+  local chk; chk="$(vm_cmd "bash $SRC_DIR/remote/setup.sh --check")"
+  printf '%s\n' "$chk" | sed 's/^/  /'
+  NEED_DEPS=0; NEED_MODELS=0
+  if [ "$FORCE" = 1 ] || grep -qE 'MISSING|cuda: +False' <<<"$chk"; then NEED_DEPS=1; fi
+  # 缓存得是 G 级的才算下全 (旗舰模型 2GB + VAD)
+  case "$chk" in
+    *"models_cache: MISSING"*) NEED_MODELS=1 ;;
+    *"models_cache: "*G*)       NEED_MODELS=0 ;;
+    *)                          NEED_MODELS=1 ;;
+  esac
+  printf '%s\n' "$chk" > "$STATE_DIR/last-check.txt"
+}
+
+cmd_setup() {
+  need_colab; session_ensure; sync_vm
+  assess_vm
+  if [ "$NEED_DEPS" = 0 ] && [ "$NEED_MODELS" = 0 ]; then
+    ok "环境已就绪 (想强制重装加 -f)"; return 0
+  fi
+
+  {   # 一步到位: 后台跑, 轮询日志
+    echo '#!/bin/bash'
+    echo "export CSG_ROOT='$ROOT' CSG_SEED_CACHE='${CSG_SEED_CACHE:-}'"
+    echo "[ '$NEED_DEPS' = 1 ] && [ '$NEED_MODELS' = 1 ] && bash $SRC_DIR/remote/setup.sh"
+    echo "[ '$NEED_DEPS' = 1 ] && [ '$NEED_MODELS' = 0 ] && bash $SRC_DIR/remote/setup.sh --deps"
+    echo "[ '$NEED_DEPS' = 0 ] && [ '$NEED_MODELS' = 1 ] && bash $SRC_DIR/remote/setup.sh --models"
+    echo 'exit 0'
+  } > "$STATE_DIR/setup-job.sh"
+
+  say "后台执行 setup (装依赖约 3-8 分钟; 下模型约 3-6 分钟) ..."
+  vm_launch "$STATE_DIR/setup-job.sh" setup | tail -1
+  vm_wait setup 3000 '=====|Downloading|Installed|already|ok ' || die "setup 未完成 (可重跑 colab-sg setup)"
+  assess_vm
+  ok "setup 完成"
+}
+
+# --------------------------------------------------------------------------
+# up / down / restart
+# --------------------------------------------------------------------------
+remote_supervisor() { vm_cmd "bash $SRC_DIR/remote/supervisor.sh $*"; }
+
+cmd_up() {
+  need_colab; session_ensure; sync_vm
+
+  assess_vm
+  if [ "$NEED_DEPS" = 1 ] || [ "$NEED_MODELS" = 1 ]; then
+    if [ "$NO_INSTALL" = 1 ]; then
+      grep -E 'MISSING|False|models_cache' "$STATE_DIR/last-check.txt" | sed 's/^/  /'
+      die "环境不完整, 先跑 colab-sg setup"
+    fi
+    warn "环境不完整, 自动补装 ..."
+    cmd_setup
+  else
+    ok "远端环境就绪"
+  fi
+
+  say "启动网关 + 隧道 (首次加载 2GB 旗舰模型, 约 1 分钟) ..."
+  # 也丢后台, 免得加载慢把 exec 拖超时
+  {
+    echo '#!/bin/bash'
+    echo "bash $SRC_DIR/remote/supervisor.sh start"
+  } > "$STATE_DIR/up-job.sh"
+  vm_launch "$STATE_DIR/up-job.sh" up | tail -1
+  vm_wait up 1800 'gateway|tunnel|PUBLIC|url|UP' >/dev/null 2>&1
+  remote_supervisor status | sed 's/^/  /'
+  wait_public_url 300
+}
+
+wait_public_url() {
+  local deadline=$(( $(date +%s) + ${1:-300} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local u
+    u="$(remote_supervisor url 2>/dev/null | tr -d '\r' | grep -oE 'https://[^ ]+' | head -1)"
+    [ -n "$u" ] && { record_url "$u"; ok "公网地址: $u"; return 0; }
+    sleep 10
+  done
+  warn "还没拿到公网地址。看: colab-sg logs"; return 1
+}
+
+record_url() {
+  local u="$1" old=""; [ -f "$URL_FILE" ] && old="$(cat "$URL_FILE")"
+  printf '%s\n' "$u" > "$URL_FILE"; refresh_env
+  if [ -n "$old" ] && [ "$old" != "$u" ]; then
+    event "url changed $old -> $u"
+    notify "Colab 网关地址已变化" "$u"
+    [ -n "$ON_URL_CHANGE" ] && CSG_URL="$u" CSG_OLD_URL="$old" bash -c "$ON_URL_CHANGE" >/dev/null 2>&1
+  fi
+}
+
+cmd_down() {
+  need_colab
+  remote_supervisor stop | sed 's/^/  /'
+  ok "服务已停"
+  if [ "$STOP_SESSION" = 1 ]; then
+    RUN_TO 240 colab stop -s "$SESSION" >/dev/null 2>&1 && ok "会话 $SESSION 已释放" || warn "会话停止失败"
+    rm -f "$URL_FILE"; refresh_env; event "session stopped"
+  else
+    dim "Colab 会话仍在 (想连会话一起释放: --stop-session)"
+  fi
+}
+
+cmd_restart() {
+  need_colab
+  warn "重建会话并拉起服务 ..."
+  remote_supervisor stop >/dev/null 2>&1 || true
+  RUN_TO 240 colab stop -s "$SESSION" >/dev/null 2>&1 || true
+  rm -f "$URL_FILE"
+  FORCE=1
+  cmd_up
+}
+
+# --------------------------------------------------------------------------
+# 查询
+# --------------------------------------------------------------------------
+cmd_status() {
+  need_colab
+  if ! session_exists; then
+    warn "会话 $SESSION 不存在 (colab-sg up)"
+    [ -s "$URL_FILE" ] && dim "上次地址(已失效): $(cat "$URL_FILE")"
+    return 1
+  fi
+  RUN_TO 90 colab status -s "$SESSION" 2>/dev/null | sed 's/^/  /'
+  dim "  ── 服务 ──"
+  remote_supervisor status 2>/dev/null | sed 's/^/  /'
+  [ -s "$URL_FILE" ] && ok "  公网地址: $(cat "$URL_FILE")"
+}
+
+cmd_url() {
+  if [ "${1:-}" = "--refresh" ] || [ ! -s "$URL_FILE" ]; then
+    local u; u="$(remote_supervisor url 2>/dev/null | tr -d '\r' | grep -oE 'https://[^ ]+' | head -1)"
+    [ -n "$u" ] && record_url "$u"
+  fi
+  [ -s "$URL_FILE" ] || die "还没有公网地址 (colab-sg up)"
+  cat "$URL_FILE"
+}
+
+cmd_logs()   { need_colab; remote_supervisor "logs ${1:-20}" 2>/dev/null; }
+cmd_exec()   { need_colab; [ $# -gt 0 ] || die "用法: colab-sg exec <命令...>"; printf '%s\n' "$*" | vm_run /dev/stdin; }
+
+notify() {
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "$1" "$2" >/dev/null 2>&1
+  fi
+}
+
+# --------------------------------------------------------------------------
+# watch / service
+# --------------------------------------------------------------------------
+cmd_watch() {
+  need_colab
+  say "保活中 (每 ${WATCH_INTERVAL}s 自检; 常驻请用 colab-sg service install)"
+  while true; do
+    if ! session_exists; then
+      warn "会话 $SESSION 不在 → 重建"
+      event "session lost, rebuilding"
+      notify "Colab 会话断开" "正在重建 $SESSION"
+      FORCE=1; cmd_up || warn "重建失败, 下轮重试"
+    else
+      local st; st="$(remote_supervisor status 2>/dev/null)"
+      if ! grep -q 'gateway:  UP' <<<"$st"; then
+        warn "网关不在 → 拉起"
+        event "gateway down, restarting"
+        remote_supervisor start >/dev/null 2>&1
+        wait_public_url 600 >/dev/null 2>&1
+      else
+        cmd_url --refresh >/dev/null 2>&1 || true
+      fi
+    fi
+    sleep "$WATCH_INTERVAL"
+  done
+}
+
+cmd_service() {
+  local action="${1:-install}" self="$SELF_DIR/$(basename "${BASH_SOURCE[0]:-$0}")"
+  local -a args=(-s "$SESSION" -g "$GPU" --port "$PORT" --root "$ROOT" --interval "$WATCH_INTERVAL")
+  [ "$TUNNEL_MODE" = "off" ] && args+=(--no-tunnel)
+  [ -n "$TUNNEL_NAME" ] && args+=(-n "$TUNNEL_NAME")
+  [ -n "${ON_URL_CHANGE:-}" ] && args+=(--on-url-change "$ON_URL_CHANGE")
+  case "$action" in
+    install)
+      case "$(uname -s)" in
+        Darwin)
+          local plist="$HOME/Library/LaunchAgents/com.colab-subtitle-gateway.plist" x=""
+          mkdir -p "$(dirname "$plist")"
+          for a in "${args[@]}"; do x="$x    <string>${a//&/&amp;}</string>"$'\n'; done
+          cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.colab-subtitle-gateway</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$self</string><string>watch</string>
+$x  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$PATH</string>
+    <key>HOME</key><string>$HOME</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$STATE_DIR/watch.out.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/watch.err.log</string>
+</dict></plist>
+EOF
+          launchctl unload "$plist" >/dev/null 2>&1
+          launchctl load "$plist" && ok "已装 launchd: $plist" \
+            || die "launchctl load 失败"
+          dim "日志 $STATE_DIR/watch.{out,err}.log; 卸载 colab-sg service uninstall"
+          ;;
+        Linux)
+          local unit="$HOME/.config/systemd/user/colab-subtitle-gateway.service"
+          mkdir -p "$(dirname "$unit")"
+          cat > "$unit" <<EOF
+[Unit]
+Description=colab-sg watch — Colab subtitle-gateway 保活
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$self watch $(printf '%q ' "${args[@]}")
+Restart=always
+RestartSec=30
+Environment=PATH=$PATH
+
+[Install]
+WantedBy=default.target
+EOF
+          command -v systemctl >/dev/null 2>&1 || die "没有 systemctl"
+          systemctl --user daemon-reload
+          systemctl --user enable --now colab-subtitle-gateway.service \
+            && ok "已装 systemd --user 单元" || die "systemctl enable 失败"
+          dim "status: systemctl --user status colab-subtitle-gateway"
+          dim "未登录也常驻: sudo loginctl enable-linger $USER"
+          ;;
+      esac
+      ;;
+    uninstall)
+      case "$(uname -s)" in
+        Darwin) launchctl unload "$HOME/Library/LaunchAgents/com.colab-subtitle-gateway.plist" 2>/dev/null
+                rm -f "$HOME/Library/LaunchAgents/com.colab-subtitle-gateway.plist"; ok "已卸载 launchd" ;;
+        Linux)  systemctl --user disable --now colab-subtitle-gateway.service 2>/dev/null
+                rm -f "$HOME/.config/systemd/user/colab-subtitle-gateway.service"
+                systemctl --user daemon-reload 2>/dev/null; ok "已卸载 systemd" ;;
+      esac
+      ;;
+    *) die "用法: colab-sg service install|uninstall" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# demo: 端到端自测
+# --------------------------------------------------------------------------
+cmd_demo() {
+  local u; u="$(cat "$URL_FILE" 2>/dev/null)"
+  [ -n "$u" ] || die "先 colab-sg up"
+  local wav="$STATE_DIR/demo.wav"
+  if [ ! -s "$wav" ]; then
+    say "取一段测试音频 (仓库自带的日语语料) ..."
+    curl -fsSL -o "$wav" https://raw.githubusercontent.com/canxin121/subtitle-gateway/main/bench/audio/ja/short.wav \
+      || die "下载测试音频失败"
+  fi
+  say "① 健康检查"; curl -s -m 20 "$u/health"; echo
+  say "② 模型列表"; curl -s -m 20 "$u/v1/models"; echo
+  say "③ ASR (旗舰模型)"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+    -F "file=@$wav" -F model=fun-asr-nano-2512; echo
+  say "④ ASR + 分段"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+    -F "file=@$wav" -F model=fun-asr-nano-2512 -F response_format=verbose_json \
+    -F 'timestamp_granularities[]=segment'; echo
+  say "⑤ 翻译 (LibreTranslate 协议)"; curl -s -m 60 -X POST "$u/translate" \
+    -H 'Content-Type: application/json' -d '{"q":"Hello world","source":"en","target":"zh"}'; echo
+  say "⑥ 翻译 (DeepL 协议)"; curl -s -m 60 -X POST "$u/v1/translate" \
+    -H 'Content-Type: application/json' -d '{"text":["Good morning"],"target_lang":"ZH"}'; echo
+}
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+cmd_doctor() {
+  say "本地环境体检"
+  printf '  平台              %s %s\n' "$(uname -s)" "$(uname -m)"
+  printf '  colab CLI         %s\n' "$(command -v colab || echo '缺失 → uv tool install google-colab-cli')"
+  printf '  timeout           %s\n' "$(command -v timeout || echo '缺失(可选, 只是少了 exec 兜底超时)')"
+  printf '  会话              %s\n' "$(sessions_raw | tr '\n' ' ' || echo 查询失败)"
+  printf '  remote/ 源        %s\n' "$([ -d "$SRC_REMOTE" ] && echo "$SRC_REMOTE" || echo 缺失)"
+  printf '  Cloudflare token  %s\n' "$([ -s "$CF_TOKEN_FILE" ] && echo "$CF_TOKEN_FILE" || echo '未配置 (quick tunnel 不需要)')"
+  printf '  状态目录          %s\n' "$STATE_DIR"
+  printf '  上次公网地址      %s\n' "$([ -s "$URL_FILE" ] && cat "$URL_FILE" || echo '(无)')"
+  command -v colab >/dev/null 2>&1 && RUN_TO 90 colab usage 2>/dev/null | sed 's/^/  /'
+}
+
+# --------------------------------------------------------------------------
+# 分发
+# --------------------------------------------------------------------------
+if [ -n "$TUNNEL_NAME" ]; then TUNNEL_MODE="named"; fi
+if [ -s "$CF_TOKEN_FILE" ]; then CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < "$CF_TOKEN_FILE")"; export CLOUDFLARE_API_TOKEN; fi
+refresh_env
+
+case "$CMD" in
+  setup)            cmd_setup ;;
+  up)               cmd_up ;;
+  down)             cmd_down ;;
+  restart)          cmd_restart ;;
+  status)           cmd_status ;;
+  url)              cmd_url "${ARGS[0]:-}" ;;
+  logs)             cmd_logs "${ARGS[0]:-}" ;;
+  exec)             cmd_exec "${ARGS[@]}" ;;
+  watch)            cmd_watch ;;
+  service:*)        cmd_service "${CMD#service:}" ;;
+  demo)             cmd_demo ;;
+  doctor)           cmd_doctor ;;
+  version|--version)say "colab-sg $CSG_VERSION" ;;
+  "")               usage ;;
+  *)                die "未知命令: $CMD (--help)" ;;
+esac

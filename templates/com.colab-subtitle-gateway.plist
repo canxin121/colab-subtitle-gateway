@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  colab-sg 的 launchd 模板 (macOS 常驻保活)。
+  一般不需要手改: 直接跑 `colab-sg service install`, CLI 会按你当前的
+  会话名/GPU/端口参数生成并加载这个 plist。这里留一份模板是为了:
+
+    * 你想手改 (比如加 CSG_ON_URL_CHANGE 之类的环境变量)
+    * 你想放到 /Library/LaunchDaemons 做成开机级服务
+
+  安装:
+    cp com.colab-subtitle-gateway.plist ~/Library/LaunchAgents/
+    # 按注释替换 __EXEC__ 占位
+    launchctl unload ~/Library/LaunchAgents/com.colab-subtitle-gateway.plist 2>/dev/null
+    launchctl load   ~/Library/LaunchAgents/com.colab-subtitle-gateway.plist
+
+  卸载:
+    launchctl unload ~/Library/LaunchAgents/com.colab-subtitle-gateway.plist
+    rm ~/Library/LaunchAgents/com.colab-subtitle-gateway.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colab-subtitle-gateway</string>
+
+  <!-- __EXEC__ 替换成 bin/colab-sg 的绝对路径; 参数按需增删 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__EXEC__</string>
+    <string>watch</string>
+    <string>-s</string>
+    <string>colab-sg</string>
+    <string>-g</string>
+    <string>T4</string>
+    <string>--port</string>
+    <string>8000</string>
+    <string>--interval</string>
+    <string>120</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- colab CLI 与 cloudflared 都得能被找到 -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- 可选: 每次公网地址变化时执行的钩子, 会带上 $CSG_URL / $CSG_OLD_URL -->
+    <!-- key>CSG_ON_URL_CHANGE</key><string>/usr/bin/curl -s "https://example.com/hook?url=$CSG_URL"</string -->
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key>
+  <string>__STATE__/watch.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE__/watch.err.log</string>
+</dict>
+</plist>

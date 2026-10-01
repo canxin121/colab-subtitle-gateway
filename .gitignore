@@ -1,0 +1,15 @@
+# 本地运行时产物
+*.log
+*.pid
+
+# 凭据: 绝不入库
+cloudflare.token
+*.token
+.env
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
