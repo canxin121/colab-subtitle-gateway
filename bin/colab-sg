@@ -629,23 +629,28 @@ EOF
 cmd_demo() {
   local u; u="$(cat "$URL_FILE" 2>/dev/null)"
   [ -n "$u" ] || die "先 colab-sg up"
-  local wav="$STATE_DIR/demo.wav"
-  if [ ! -s "$wav" ]; then
-    say "取一段测试音频 (仓库自带的日语语料) ..."
+  # 测试音频不落本地: 直连 raw.githubusercontent.com 在被污染的 DNS 下会超时,
+  # 而 VM 上就有仓库自带的语料。VM 取不到时再退回本地下载。
+  local wav; wav="$(mktemp "${TMPDIR:-/tmp}/csg-demo.XXXXXX.wav")"
+  say "取一段测试音频 (VM 上仓库自带的日语语料) ..."
+  if vm_cmd "base64 -w0 '$REPO_DIR/bench/audio/ja/short.wav'" 2>/dev/null \
+       | grep -oE '[A-Za-z0-9+/=]{100,}' | head -1 | tr -d '\n' | base64 -d > "$wav" 2>/dev/null && [ -s "$wav" ]; then
+    dim "  $(wc -c < "$wav" | tr -d ' ') 字节"
+  else
     curl -fsSL -o "$wav" https://raw.githubusercontent.com/canxin121/subtitle-gateway/main/bench/audio/ja/short.wav \
-      || die "下载测试音频失败"
+      || die "拿测试音频失败 (VM 取不到, 本地下载也失败)"
   fi
   say "① 健康检查"; curl -s -m 20 "$u/health"; echo
-  say "② 模型列表"; curl -s -m 20 "$u/v1/models"; echo
-  say "③ ASR (旗舰模型)"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+  say "② ASR (旗舰模型)"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
     -F "file=@$wav" -F model=fun-asr-nano-2512; echo
-  say "④ ASR + 分段"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
+  say "③ ASR + 分段"; curl -s -m 300 -X POST "$u/v1/audio/transcriptions" \
     -F "file=@$wav" -F model=fun-asr-nano-2512 -F response_format=verbose_json \
     -F 'timestamp_granularities[]=segment'; echo
-  say "⑤ 翻译 (LibreTranslate 协议)"; curl -s -m 60 -X POST "$u/translate" \
+  say "④ 翻译 (LibreTranslate 协议)"; curl -s -m 60 -X POST "$u/translate" \
     -H 'Content-Type: application/json' -d '{"q":"Hello world","source":"en","target":"zh"}'; echo
-  say "⑥ 翻译 (DeepL 协议)"; curl -s -m 60 -X POST "$u/v1/translate" \
+  say "⑤ 翻译 (DeepL 协议)"; curl -s -m 60 -X POST "$u/v1/translate" \
     -H 'Content-Type: application/json' -d '{"text":["Good morning"],"target_lang":"ZH"}'; echo
+  rm -f "$wav"
 }
 
 # --------------------------------------------------------------------------

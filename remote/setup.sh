@@ -38,13 +38,6 @@ check() {
   step "体检"
   echo "python(venv): $([ -x "$PY" ] && "$PY" -V 2>&1 || echo MISSING)"
   echo "repo:         $([ -d "$REPO/.git" ] && echo OK || echo MISSING)"
-  echo "manifest:     $(python3 -c "
-import json,sys
-try:
-    m=json.load(open('$REPO/models.json'))
-    print(','.join(m['models']), '| preload', ','.join(m.get('preload',[])))
-except Exception as e: print('ERR', e)
-")"
   echo "models_cache: $(du -sh "$REPO/models_cache" 2>/dev/null | cut -f1 || echo MISSING)"
   # 清单里声明的模型逐个核对缓存 (只看目录大小会把"别的模型下过了"误判成已就绪)
   python3 - "$REPO" <<'PY'
