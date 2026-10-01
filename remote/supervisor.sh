@@ -52,8 +52,10 @@ tu_pid() { [ -f "$TU_PID" ] && cat "$TU_PID" || true; }
 start_gateway() {
   if gw_alive; then log "gateway already up"; return 0; fi
   : > "$GW_LOG"
-  setsid nohup "$PY" -m gateway --device cuda --port "$PORT" \
-    --cache-dir "$REPO/models_cache" --translate-free google,edge \
+  # 必须 cd 进 repo 再 -m gateway: python -m 靠 sys.path[0]=cwd 找包, 而 kernel 的
+  # cwd 是 /content, 直接跑会 "No module named gateway" (日志里看着像秒退)。
+  setsid nohup bash -c "cd '$REPO' && exec '$PY' -m gateway --device cuda --port '$PORT' \
+    --cache-dir '$REPO/models_cache' --translate-free google,edge" \
     >> "$GW_LOG" 2>&1 < /dev/null &
   echo $! > "$GW_PID"
   log "gateway started pid=$(cat "$GW_PID")"

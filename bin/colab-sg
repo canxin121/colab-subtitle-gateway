@@ -173,7 +173,9 @@ vm_run() {  # stdin = 要在 VM 上执行的 shell
   rm -f "$f"
   return $rc
 }
-vm_cmd() { printf '%s\n' "$*" | vm_run; }
+# 内部探活用: 远端脚本的非零退出会让 colab exec 抛 CalledProcessError 并打出一大段
+# Python traceback, 而调用方只看输出文本, 所以这里吞掉退出码。
+vm_cmd() { printf '%s\n' "$*" | vm_run || true; }
 
 # 本地文件原样送进 VM 跑 (自动补 %%bash 头)
 vm_run_file() {
