@@ -39,7 +39,7 @@ SRC_REMOTE="$SELF_DIR/../remote"
 
 TUNNEL_NAME="${CSG_TUNNEL_NAME:-}"
 TUNNEL_MODE="quick"                              # quick | off (给了 -n 就是命名隧道)
-STOP_SESSION=0; FORCE=0; NO_INSTALL=0; DEMO=0
+STOP_SESSION=0; FORCE=0; NO_INSTALL=0; DEMO=0; REFRESH=0
 
 # 远端路径 (随 --root 变)
 set_paths() {
@@ -100,6 +100,7 @@ colab-sg $CSG_VERSION — Colab GPU 上的 subtitle-gateway 服务端 + 公网�
                         (没有时自动读环境里的 HTTPS_PROXY)
       --interval N      watch: 保活间隔秒数 (默认 120)
       --on-url-change C watch: 地址变化时执行 C (新地址在 \$CSG_URL)
+      --refresh         url: 强制回 VM 重读一次地址 (也接受 url --refresh)
   -f, --force           setup: 强制重装依赖; up: 强制重建会话
       --no-install      up: 环境不全时不要自动补装, 直接失败
       --stop-session    down: 连 Colab 会话一起释放
@@ -124,6 +125,7 @@ while [ $# -gt 0 ]; do
     --timeout)         EXEC_TIMEOUT="$2"; shift 2 ;;
     --proxy)           PROXY="$2"; shift 2 ;;
     --interval)        WATCH_INTERVAL="$2"; shift 2 ;;
+    --refresh)         REFRESH=1; shift ;;   # url: 强制回 VM 重新读一次地址
     --on-url-change)   ON_URL_CHANGE="$2"; shift 2 ;;
     -f|--force)        FORCE=1; shift ;;
     --no-install)      NO_INSTALL=1; shift ;;
@@ -449,6 +451,8 @@ record_url() {
   local u="$1" old=""; [ -f "$URL_FILE" ] && old="$(cat "$URL_FILE")"
   printf '%s\n' "$u" > "$URL_FILE"; refresh_env
   if [ -n "$old" ] && [ "$old" != "$u" ]; then
+    # quick tunnel 重建会话就会换域名, 客户端得跟着改 —— 每次变化都显式说出来
+    warn "公网地址变了: $old -> $u"
     event "url changed $old -> $u"
     notify "Colab 网关地址已变化" "$u"
     [ -n "$ON_URL_CHANGE" ] && CSG_URL="$u" CSG_OLD_URL="$old" bash -c "$ON_URL_CHANGE" >/dev/null 2>&1
@@ -496,6 +500,10 @@ cmd_status() {
   dim "  ── 服务 ──"
   local svc; svc="$(remote_supervisor status 2>/dev/null)"
   printf '%s\n' "$svc" | sed 's/^/  /'
+  # status 的输出里就带着 VM 当前的隧道地址, 顺手同步到本地 state:
+  # quick tunnel 每次重建都会换域名, 不同步的话本地会一直拿着旧地址 (客户端会连到死域名)。
+  local live; live="$(printf '%s\n' "$svc" | grep -oE 'url: *https://[^ ]+' | grep -oE 'https://[^ ]+' | head -1)"
+  [ -n "$live" ] && record_url "$live"
   if [ -s "$URL_FILE" ]; then
     # 隧道没起来时 url 文件里是上一次的地址, 别当下线中的服务显示
     if printf '%s\n' "$svc" | grep -q 'tunnel:   UP'; then
@@ -507,9 +515,14 @@ cmd_status() {
 }
 
 cmd_url() {
-  if [ "${1:-}" = "--refresh" ] || [ ! -s "$URL_FILE" ]; then
+  if [ "$REFRESH" = 1 ] || [ "${1:-}" = "--refresh" ] || [ ! -s "$URL_FILE" ]; then
     local u; u="$(remote_supervisor url 2>/dev/null | tr -d '\r' | grep -oE 'https://[^ ]+' | head -1)"
-    [ -n "$u" ] && record_url "$u"
+    if [ -n "$u" ]; then
+      record_url "$u"
+    else
+      warn "远端没给出地址 (服务没起? 看 colab-sg logs)"
+      [ -s "$URL_FILE" ] || return 1
+    fi
   fi
   [ -s "$URL_FILE" ] || die "还没有公网地址 (colab-sg up)"
   cat "$URL_FILE"

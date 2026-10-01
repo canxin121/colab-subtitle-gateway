@@ -56,7 +56,7 @@ start_gateway() {
   # cwd 是 /content, 直接跑会 "No module named gateway" (日志里看着像秒退)。
   # 先写 pid 文件再进后台: bash -c 会把 $$ 换成那个子 shell 自己的 pid, 正是我们
   # 需要用来 kill 的进程。
-  setsid nohup bash -c "echo \$\$ > '$GW_PID'; exec '$PY' -m gateway --device cuda --port '$PORT' \
+  setsid nohup bash -c "echo \$\$ > '$GW_PID'; cd '$REPO' && exec '$PY' -m gateway --device cuda --port '$PORT' \
     --cache-dir '$REPO/models_cache' --translate-free google,edge" \
     >> "$GW_LOG" 2>&1 < /dev/null &
   sleep 1
@@ -126,6 +126,18 @@ wait_url() {      # 抓一次公网地址 (quick tunnel 才会出现在日志里
   return 1
 }
 
+# 域名出现 ≠ 已经能过流量 (cloudflared 注册连接还要几秒)。等它真的能通再报 UP,
+# 否则刚 start 完的 status 总是显示 tunnel: DOWN, 像是失败了。
+wait_tunnel_live() {   # $1 = 秒
+  local n="${1:-120}" i=0
+  while [ "$i" -lt "$n" ]; do
+    tun_alive && { log "tunnel reachable after ${i}s"; return 0; }
+    sleep 2; i=$((i+2))
+  done
+  log "tunnel NOT reachable after ${n}s"
+  return 1
+}
+
 # --------------------------------------------------------------------------
 # 保活循环 (start 时后台起, 每 60s 自检一次)
 # --------------------------------------------------------------------------
@@ -136,7 +148,7 @@ watch_loop() {
   while true; do
     sleep 60
     gw_alive || { log "gateway health failed, restarting"; stop_gateway; start_gateway; wait_health 900; }
-    tun_alive || { log "tunnel health failed, restarting"; stop_tunnel; start_tunnel; wait_url 90; }
+    tun_alive || { log "tunnel health failed, restarting"; stop_tunnel; start_tunnel; wait_url 90 && wait_tunnel_live 120; }
   done
 }
 
@@ -147,7 +159,7 @@ case "${1:-status}" in
     start_gateway
     wait_health 900
     start_tunnel
-    wait_url 120
+    wait_url 120 && wait_tunnel_live 180
     if ! pid_alive "$(cat "$RUN/watch.pid" 2>/dev/null || echo)"; then
       setsid nohup "$0" watch >> "$SUP_LOG" 2>&1 < /dev/null &
       log "watch loop spawned"
