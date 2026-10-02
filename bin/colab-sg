@@ -314,7 +314,10 @@ prefer_ipv4() {   # 幂等; 只在 IPv6 黑洞时生效
   if [ -n "${PYTHONPATH:-}" ]; then PYTHONPATH="$SELF_DIR/ipv4-first:$PYTHONPATH"
   else PYTHONPATH="$SELF_DIR/ipv4-first"; fi
   export PYTHONPATH
-  dim "  本机 IPv6 不可达 → Python 优先走 IPv4 (colab CLI 不再卡 2 分钟)"
+  # 必须写 stderr: 这里在 colab_to 内部, 输出会被 vm_cmd / vm_wait 的 $(...) 捕获,
+  # 往 stdout 写一行提示就会顶掉 "DONE 0" 这类哨兵行, vm_wait 于是永远等不到完成。
+  [ -n "${_IPV4_NOTIFIED:-}" ] || { _IPV4_NOTIFIED=1
+    printf '%s\n' "${C_DIM}  本机 IPv6 不可达 → Python 优先走 IPv4 (colab CLI 不再卡 2 分钟)${C_OFF}" >&2; }
 }
 
 # 只在真正需要访问 Google 的调用上套代理: 本机对 google 域名的解析可能被劫持/污染,

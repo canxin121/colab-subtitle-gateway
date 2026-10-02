@@ -102,13 +102,20 @@ check() {
   verdict="$(python3 - "$REPO" "$SELECTED" "$CSG_ROOT/models.upstream.json" <<'PY'
 import json, pathlib, sys
 repo = pathlib.Path(sys.argv[1]); sel = pathlib.Path(sys.argv[2]); upf = pathlib.Path(sys.argv[3])
-def present(cache, hub, name):
-    root = (cache / "hub" / ("models--" + name.replace("/", "--"))) if hub == "hf" \
+def snap_dirs(cache, hub, name):
+    """该模型在缓存里对应的 snapshots 目录 (hub=ms 走 models/, hf 走 hub/models--*)。"""
+    base = (cache / "hub" / ("models--" + name.replace("/", "--"))) if hub == "hf" \
         else (cache / "models" / name.replace("/", "--"))
-    if not root.is_dir(): return False
-    snaps = [p for p in (root / "snapshots").glob("*") if p.is_dir()]
-    biggest = max((p.stat().st_size for p in snaps[0].rglob("*") if p.is_file()), default=0) if snaps else 0
-    return biggest > 100 * 1024 * 1024
+    return [p for p in (base / "snapshots").glob("*") if p.is_dir()] if base.is_dir() else []
+def present(cache, hub, name, min_bytes=100 * 1024 * 1024):
+    # 名字要试两种写法: 清单里写的是 "fsmn-vad", 而 FunASR 自己的 resolver 会把它
+    # 补成 "funasr/fsmn-vad" 再落盘 (models--funasr--fsmn-vad)。
+    # 只按清单里的写法找, 永远找不到 → 每次 up/setup 都判定缺失, 重下 1.9G 的模型。
+    for candidate in ([name] if "/" in name else [name, "funasr/" + name]):
+        for snap in snap_dirs(cache, hub, candidate):
+            biggest = max((p.stat().st_size for p in snap.rglob("*") if p.is_file()), default=0)
+            if biggest > min_bytes: return True
+    return False
 
 cache = repo / "models_cache"
 try:
@@ -131,7 +138,10 @@ missing = []
 for key, entry in (want or {}).get("models", {}).items():
     hub, name = entry.get("hub", "ms"), entry["model"]
     ok = present(cache, hub, name)
-    if ok and entry.get("vad_model") and not present(cache, hub, entry["vad_model"]): ok = False
+    # VAD 本来就是小模型 (fsmn-vad 约 2MB), 用 100MB 那个阈值永远判缺失。
+    # 这里只要目录里有非空文件即算就绪。
+    if ok and entry.get("vad_model") and not present(cache, hub, entry["vad_model"], min_bytes=1):
+        ok = False
     if not ok: missing.append(key)
     print("  %-20s %-3s %-8s %s" % (key, hub, "OK" if ok else "MISSING", name))
 print("MODELS_STATE %s" % ("ok" if want and not missing else "missing"))
