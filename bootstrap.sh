@@ -175,4 +175,8 @@ say "交给仓库里的 install.sh (装命令 + 交互式向导) ..."
 # exec 而不是普通调用: 向导要从终端读输入并决定退出码, 中间不要再夹一层。
 INSTALL_ENV=("CSG_INSTALLER_REF=$REF" "CSG_INSTALLER_HEAD=$INSTALLER_HEAD")
 [ -n "$BOOTSTRAP_PROXY" ] && INSTALL_ENV+=("CSG_PROXY=$BOOTSTRAP_PROXY")
+# curl | bash 把脚本本身占了 stdin; 有控制终端时显式通知向导改从 /dev/tty 交互。
+if [ ! -t 0 ] && ( : < /dev/tty ) 2>/dev/null; then
+  INSTALL_ENV+=("CSG_INTERACTIVE_TTY=1")
+fi
 exec env "${INSTALL_ENV[@]}" bash "$DIR/install.sh" ${PASSTHRU[@]+"${PASSTHRU[@]}"}
