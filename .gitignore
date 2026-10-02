@@ -12,6 +12,7 @@ secrets.env
 config.sh
 *.selected.json
 models.upstream.json
+*_output.ipynb
 
 # 编辑器 / 系统
 .DS_Store

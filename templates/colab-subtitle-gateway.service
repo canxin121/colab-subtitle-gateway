@@ -1,49 +1,39 @@
-# colab-sg 的 systemd 模板 (Linux 常驻保活)
+# colab-sg notebook launcher — systemd user service
 #
-# 一般不需要手改: `colab-sg service install` 会按你当前的参数生成并启用单元。
-# 这份模板给需要手改 (加环境变量、改重启策略) 或想装成系统级服务的场景。
+# This unit is intentionally only a local recovery loop. The notebook owns all
+# deployment/configuration logic; keep CONFIG["mode"] = "deploy" in colab-sg.ipynb.
+# Replace the placeholders before installing:
+#   __EXEC__     absolute path to the colab executable
+#   __SESSION__  Colab session name (same as CONFIG["session"])
+#   __GPU__      GPU variant (same as CONFIG["gpu"])
+#   __NOTEBOOK__ absolute path to colab-sg.ipynb
+#   __PATH__     PATH including the colab executable's directory
 #
-# 用户级安装 (推荐, 不需要 root):
-#   mkdir -p ~/.config/systemd/user
-#   cp colab-subtitle-gateway.service ~/.config/systemd/user/
-#   # 把 __EXEC__ 换成 bin/colab-sg 的绝对路径
+# Install as ~/.config/systemd/user/colab-subtitle-gateway.service, then:
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now colab-subtitle-gateway
-#   # 未登录也常驻 (否则只在登录会话里跑):
-#   sudo loginctl enable-linger "$USER"
+#   sudo loginctl enable-linger "$USER"   # optional: run when logged out
 #
-# 系统级安装 (开机即跑, 与登录无关): 放到 /etc/systemd/system/, 加上
-#   User=<你的用户名>  和  Environment=HOME=/home/<用户>
-#
-# 常用:
-#   systemctl --user status  colab-subtitle-gateway
-#   systemctl --user restart colab-subtitle-gateway
+# Inspect/restart/remove:
+#   systemctl --user status colab-subtitle-gateway
 #   journalctl --user -u colab-subtitle-gateway -f
+#   systemctl --user disable --now colab-subtitle-gateway
 
 [Unit]
-Description=colab-sg watch — 在 Colab GPU 上保活 subtitle-gateway 并维持公网入口
+Description=Run the colab-sg deployment notebook and recover Colab sessions
 Documentation=https://github.com/canxin121/colab-subtitle-gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-
-# __EXEC__ 换成 bin/colab-sg 的绝对路径。
-# 参数只剩 watch: 会话名/GPU/端口/模型/协议/隧道这些设置都在
-# ~/.config/colab-subtitle-gateway/config.sh 里, 脚本启动时自己读, 改配置不用重装单元。
-ExecStart=__EXEC__ watch
-
+Environment="PATH=__PATH__"
+ExecStart=/bin/bash -c "while :; do if \"__EXEC__\" status -s \"__SESSION__\" 2>&1 | grep -F \"Session '__SESSION__' not found.\" >/dev/null; then \"__EXEC__\" new --gpu \"__GPU__\" -s \"__SESSION__\" || true; fi; \"__EXEC__\" exec -s \"__SESSION__\" -f \"__NOTEBOOK__\" --timeout 21600 || true; sleep 120; done"
 Restart=always
 RestartSec=30
 
-# colab CLI 需要; 若用 uv 装的工具也在这个 PATH 上
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-
-# 可选: 每次公网地址变化时的钩子 ($CSG_URL / $CSG_OLD_URL 可用)
-# Environment=CSG_ON_URL_CHANGE=/usr/bin/curl -s "https://example.com/hook?url=$CSG_URL"
-
-# 让日志进 journal
+# The loop writes progress and errors to the journal. It deliberately retries
+# after a failed exec; colab exec output includes notebook cell diagnostics.
 StandardOutput=journal
 StandardError=journal
 
