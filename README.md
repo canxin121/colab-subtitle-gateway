@@ -23,17 +23,44 @@
 
 ## 安装
 
+**新机器一键装**（不用先 clone）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/colab-subtitle-gateway/main/bootstrap.sh | bash
+```
+
+它会 clone 到 `~/.local/share/colab-subtitle-gateway`、把 `colab-sg` 软链进 `~/.local/bin`，
+然后直接进交互式向导。管道模式下给参数要写成 `bash -s -- …`：
+
+```bash
+curl -fsSL …/bootstrap.sh | bash -s -- --system   # 装到 /usr/local/bin
+curl -fsSL …/bootstrap.sh | bash -s -- --yes      # 跳过配置选择 (首次 Colab OAuth 仍需浏览器授权)
+curl -fsSL …/bootstrap.sh | bash -s -- --ref main      # 也可指定已有的分支或标签
+```
+
+`bootstrap.sh` 会准备 Git / `uv` / Google Colab CLI（缺少 Git 时尽可能调用系统包管理器安装），
+把仓库弄到本地，再把控制权交给仓库里的 `install.sh`；安装与向导逻辑只有一份。
+所以远端执行需要的 `remote/*.sh` 始终在同一个目录，`colab-sg upgrade` 也按安装时记录的分支或标签更新它，且发现本地改动时不会覆盖。
+
+| 选项 | 作用 |
+|---|---|
+| `--dir DIR` | 仓库落地目录（默认 `~/.local/share/colab-subtitle-gateway`） |
+| `--ref REF` | 用哪个分支或标签（默认 `main`）；写入本地配置，`colab-sg upgrade` 继续跟随它 |
+| `--proxy URL` | 下载仓库、安装 CLI 与访问 Colab 走的代理（默认读 `https_proxy` / `HTTPS_PROXY`） |
+| `--system` / `--no-wizard` / `--yes` | 原样转给 `install.sh` |
+| `-- <参数…>` | `--` 之后的参数原样交给 `install.sh` |
+
+已经 clone 过就直接用仓库里的脚本（两者等价）：
+
 ```bash
 git clone https://github.com/canxin121/colab-subtitle-gateway.git
 cd colab-subtitle-gateway
 ./install.sh            # 软链到 ~/.local/bin，然后进交互式向导
 ```
 
-先装 Colab 官方 CLI（本仓库的远端执行全靠它）：
-
-```bash
-uv tool install google-colab-cli
-```
+bootstrap 会自动检查并安装 `uv` 与 Google Colab CLI；Linux 上缺少 Git 时会尝试用系统包管理器补齐。
+运行环境需要 `curl` 和 Bash；macOS 首次使用 Git 时，系统可能会提示安装 Xcode Command Line Tools。
+安装结束后向导会引导完成 Colab 登录、GPU 会话创建、模型下载与服务启动。
 
 `./install.sh` 接下来的向导会一步步问：
 
@@ -47,8 +74,8 @@ uv tool install google-colab-cli
 7. **装依赖 + 下模型** — 只下选中的那几个
 8. **起服务 → 自测 → 可选装成常驻服务**
 
-全程零交互也行：`./install.sh --yes`（全部取默认），`colab-sg install --dry-run` 只打印
-将要执行的远端动作和本次选择，不碰 VM。
+不想逐项选择时可用 `./install.sh --yes` 取默认；如果 Colab 尚未登录，仍需在浏览器完成一次 OAuth 授权。
+`colab-sg install --dry-run` 只打印将要执行的远端动作和本次选择，不碰 VM。
 
 > 需要 Colab 账号本身能建 GPU 运行时（免费额度即可拿到 T4，实测可用）。
 > 免费额度的会话随时可能被回收——这正是 `watch` 存在的理由。

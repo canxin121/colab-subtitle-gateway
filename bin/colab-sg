@@ -73,6 +73,16 @@ ENCRYPTION_KEY="${CSG_ENCRYPTION_KEY:-}"
 TRANSLATE_API_KEY="${CSG_TRANSLATE_API_KEY:-}"
 LIBRETRANSLATE_API_KEY="${CSG_LIBRETRANSLATE_API_KEY:-}"
 UPSTREAM_REV="${CSG_UPSTREAM_REV:-}"
+INSTALLER_REF="${CSG_INSTALLER_REF:-}"
+INSTALLER_HEAD="${CSG_INSTALLER_HEAD:-}"
+LOCAL_REPO_ROOT="$(git -C "$SELF_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$INSTALLER_REF" ] && [ -n "$LOCAL_REPO_ROOT" ]; then
+  INSTALLER_REF="$(git -C "$LOCAL_REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$LOCAL_REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null || true)"
+fi
+[ -n "$INSTALLER_REF" ] || INSTALLER_REF="main"
+if [ -z "$INSTALLER_HEAD" ] && [ -n "$LOCAL_REPO_ROOT" ]; then
+  INSTALLER_HEAD="$(git -C "$LOCAL_REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+fi
 URL_FILE="$STATE_DIR/url"
 EVENTS="$STATE_DIR/events.log"
 ON_URL_CHANGE="${CSG_ON_URL_CHANGE:-}"
@@ -263,13 +273,28 @@ need_colab() { command -v colab >/dev/null 2>&1 || die "找不到 colab CLI。�
 # 必须经 `env` 而不是直接前缀变量: RUN_TO 是 timeout(外部命令), 它没法执行 shell 函数。
 colab_to() {  # $1 = 超时秒数, 其余是 colab 的子命令
   local t="$1"; shift
+  local send_tty=0
+  # stdin 被占着 (curl | bash 那种) 时, 把 /dev/tty 当 stdio 递给 colab ——
+  # 它没有内建的 /dev/tty 回退, 会直接 read 管道里的脚本内容当授权码。
+  [ -t 0 ] || [ ! -e /dev/tty ] || send_tty=1
   if [ -n "$PROXY" ]; then
-    RUN_TO "$t" env \
-      HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" ALL_PROXY="$PROXY" \
-      NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
-      colab "$@"
+    if [ "$send_tty" = 1 ]; then
+      RUN_TO "$t" env \
+        HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" ALL_PROXY="$PROXY" \
+        NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
+        colab "$@" < /dev/tty
+    else
+      RUN_TO "$t" env \
+        HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" ALL_PROXY="$PROXY" \
+        NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
+        colab "$@"
+    fi
   else
-    RUN_TO "$t" colab "$@"
+    if [ "$send_tty" = 1 ]; then
+      RUN_TO "$t" colab "$@" < /dev/tty
+    else
+      RUN_TO "$t" colab "$@"
+    fi
   fi
 }
 
@@ -792,6 +817,9 @@ notify() {
 # 才从 stdin 读。
 # 写: 同理 —— 终端里写 /dev/tty (输出干净), 管道里写 stdout (测试能看到提示)。
 _prompt() {  # $1 = 末尾要不要换行 (n = 不换)
+  # 只有**标准输入**接了终端才算交互。注意 `curl | bash` 那种一键安装: 脚本内容走
+  # stdin (不是终端), 但终端本身还在 —— 此时往 /dev/tty 写提示、却从管道里读, 就是
+  # 提示铺满屏幕而没人读得到答案。所以这里一律跟着 stdin 走。
   if [ -t 0 ]; then printf '%s' "$2" > /dev/tty
   else printf '%s' "$2"; fi
   [ "${1:-y}" = y ] && { [ -t 0 ] && printf '\n' > /dev/tty || printf '\n'; }
@@ -799,6 +827,8 @@ _prompt() {  # $1 = 末尾要不要换行 (n = 不换)
 }
 
 tty_read() {   # 读一行到 $1
+  # stdin 是终端就只从 /dev/tty 读 (把 stdin 留给脚本内容), 否则读 stdin
+  # (也可以是管道喂答案: `printf 'a\nb\n' | bash bootstrap.sh --yes` 之类的自动化)。
   # 中间变量不能叫 line: 调用方 (ask / ask_yes / pick_multi) 自己就有个叫 line 的
   # 局部变量, 而 bash 的动态作用域让被调函数里的 local 直接盖住它 —— read 填进去的
   # 字符串会随本函数返回一起消失, 调用方读到的永远是空。
@@ -1069,6 +1099,8 @@ CSG_PROXY="\${CSG_PROXY-$PROXY}"
 CSG_WATCH_INTERVAL="\${CSG_WATCH_INTERVAL-$WATCH_INTERVAL}"
 CSG_UV_INDEX="\${CSG_UV_INDEX-${CSG_UV_INDEX:-}}"
 CSG_UPSTREAM_REV="\${CSG_UPSTREAM_REV-$UPSTREAM_REV}"
+CSG_INSTALLER_REF="\${CSG_INSTALLER_REF-$INSTALLER_REF}"
+CSG_INSTALLER_HEAD="\${CSG_INSTALLER_HEAD-$INSTALLER_HEAD}"
 EOF
   )
   chmod 600 "$CONFIG_FILE"
@@ -1389,10 +1421,43 @@ cmd_models() {
 cmd_upgrade() {
   need_colab
   say "升级 colab-sg 本地脚本与 VM 侧环境 ..."
-  local repo_dir; repo_dir="$(cd "$SELF_DIR/.." && pwd)"
-  if [ -d "$repo_dir/.git" ]; then
-    git -C "$repo_dir" pull --ff-only 2>&1 | tail -3 | sed 's/^/  /' || warn "git pull 失败 (本地有改动?), 继续用当前代码"
+  local repo_dir="${LOCAL_REPO_ROOT:-}"
+  if [ -n "$repo_dir" ]; then
+    local dirty; dirty="$(git -C "$repo_dir" status --porcelain 2>/dev/null)"
+    [ -z "$dirty" ] || die "安装器仓库有未提交改动: $repo_dir (先提交/暂存，避免升级覆盖)"
+    local current_head; current_head="$(git -C "$repo_dir" rev-parse HEAD)"
+    if [ -n "$INSTALLER_HEAD" ] && [ "$current_head" != "$INSTALLER_HEAD" ]; then
+      die "安装器版本已被手动改动/切换 (当前 $current_head, 记录 $INSTALLER_HEAD); 不会覆盖它。"
+    fi
+
+    local -a git_proxy=()
+    if [ -n "$PROXY" ]; then
+      git_proxy=(-c "http.proxy=$PROXY" -c "https.proxy=$PROXY")
+    elif [ -n "${https_proxy:-}" ]; then
+      git_proxy=(-c "http.proxy=$https_proxy" -c "https.proxy=$https_proxy")
+    fi
+    git ${git_proxy[@]+"${git_proxy[@]}"} -C "$repo_dir" fetch --depth 1 origin "$INSTALLER_REF" -q \
+      || die "无法获取安装器 $INSTALLER_REF (网络/代理?)"
+    local target_head; target_head="$(git -C "$repo_dir" rev-parse FETCH_HEAD)"
+    if [ "$current_head" != "$target_head" ]; then
+      git -C "$repo_dir" reset --hard "$target_head" \
+        || die "更新安装器失败; 可重新运行 bootstrap.sh --ref $INSTALLER_REF"
+      ok "安装器已更新到 $INSTALLER_REF ($target_head)"
+    else
+      dim "  安装器已是 $INSTALLER_REF 最新版本"
+    fi
+    INSTALLER_HEAD="$target_head"
+    CSG_INSTALLER_HEAD="$target_head"
+    CSG_INSTALLER_REF="$INSTALLER_REF"
+    if [ -d "$repo_dir/.git" ]; then
+      printf '%s\n' "$target_head" > "$repo_dir/.git/colab-sg-bootstrap-head"
+    fi
+    # 本地代码已前移; 先持久化新 HEAD, 即使后续 Colab 不可用, 下次 upgrade 也能重试。
+    write_config_sh
+  else
+    warn "当前是 --copy 安装, 找不到仓库; 本地脚本需重新运行 bootstrap.sh 更新"
   fi
+
   local old_rev="$UPSTREAM_REV"
   session_ensure; sync_vm
   write_driver; refresh_env; vm_run_file "$VM_DRIVER" | tail -1
