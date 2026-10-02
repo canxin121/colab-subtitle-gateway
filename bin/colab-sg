@@ -267,16 +267,69 @@ esac
 # --------------------------------------------------------------------------
 need_colab() { command -v colab >/dev/null 2>&1 || die "找不到 colab CLI。装: uv tool install google-colab-cli"; }
 
+# --------------------------------------------------------------------------
+# Python 侧 IPv4 优先 (本机 IPv6 出口是黑洞时)
+# 症状: AAAA 记录有, 但 SYN 发出去没人应 —— 连接既不报错也不成功, 只吃满 connect
+# 超时。colab CLI 是 Python, socket.create_connection 按 getaddrinfo 顺序串行重试,
+# 一次请求要等 4x30s, 表现就是 `colab sessions` 无输出地挂住 (被误当成"要挂代理")。
+# 这里只在**探测确认 IPv6 不通**时才把 bin/ipv4-first 挂上 PYTHONPATH, 只影响 Python
+# 子进程, 不动系统解析、不动 git/curl, 双栈都通的环境不做任何改变。
+# --------------------------------------------------------------------------
+_ipv6_dead() {
+  [ -n "${CSG_SKIP_IPV6_PROBE:-}" ] && return 1
+  local cache="$STATE_DIR/.ipv6"
+  if [ -f "$cache" ]; then
+    local age; age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    # 网络会变 (换 WiFi / 开代理), 结论只信 10 分钟
+    [ "$age" -lt 600 ] && [ "$(cat "$cache")" = dead ] && return 0
+    [ "$age" -lt 600 ] && return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  local rc=1
+  python3 - <<'PY' && rc=0
+import socket, sys
+try:
+    infos = [a for a in socket.getaddrinfo("dns.google", 443, proto=socket.IPPROTO_TCP)
+             if a[0] == socket.AF_INET6]
+except OSError:
+    sys.exit(1)
+if not infos:
+    sys.exit(1)                      # 没有 AAAA: 与 IPv6 无关
+try:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(infos[0][4])
+    s.close()
+except OSError:
+    sys.exit(0)                      # 解析得出来却连不上 = 黑洞
+sys.exit(1)
+PY
+  printf '%s\n' "$([ "$rc" = 0 ] && echo dead || echo ok)" > "$cache" 2>/dev/null || true
+  return $(( rc == 0 ? 0 : 1 ))
+}
+prefer_ipv4() {   # 幂等; 只在 IPv6 黑洞时生效
+  case ":${PYTHONPATH:-}:" in *":$SELF_DIR/ipv4-first:"*) return 0 ;; esac
+  [ -d "$SELF_DIR/ipv4-first" ] || return 0
+  _ipv6_dead || return 0
+  if [ -n "${PYTHONPATH:-}" ]; then PYTHONPATH="$SELF_DIR/ipv4-first:$PYTHONPATH"
+  else PYTHONPATH="$SELF_DIR/ipv4-first"; fi
+  export PYTHONPATH
+  dim "  本机 IPv6 不可达 → Python 优先走 IPv4 (colab CLI 不再卡 2 分钟)"
+}
+
 # 只在真正需要访问 Google 的调用上套代理: 本机对 google 域名的解析可能被劫持/污染,
 # 直连会挂在超时上 (colab sessions 无输出地卡 2 分钟), 走代理立刻返回。
 # 注意 Cloudflare 隧道与本地 curl 不走这里, 避免把本来直连就通的流量绕出去。
 # 必须经 `env` 而不是直接前缀变量: RUN_TO 是 timeout(外部命令), 它没法执行 shell 函数。
 colab_to() {  # $1 = 超时秒数, 其余是 colab 的子命令
   local t="$1"; shift
+  prefer_ipv4
   local send_tty=0
   # stdin 被占着 (curl | bash 那种) 时, 把 /dev/tty 当 stdio 递给 colab ——
   # 它没有内建的 /dev/tty 回退, 会直接 read 管道里的脚本内容当授权码。
-  [ -t 0 ] || [ ! -e /dev/tty ] || send_tty=1
+  # 不能用 `[ -e /dev/tty ]`: 后台任务/无控制终端的会话里这个路径**存在但打不开**
+  # (open 报 "Device not configured"), 那样重定向会在执行前就失败, 命令根本没跑。
+  if [ ! -t 0 ] && ( : < /dev/tty ) 2>/dev/null; then send_tty=1; fi
   if [ -n "$PROXY" ]; then
     if [ "$send_tty" = 1 ]; then
       RUN_TO "$t" env \
